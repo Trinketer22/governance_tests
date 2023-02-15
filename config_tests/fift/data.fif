@@ -1,0 +1,13 @@
+"TonUtil.fif" include
+"Asm.fif" include
+
+"fift/config.cell" file>B B>boc // Config dictionary from masterchain
+
+0xEC7AAF27B38E7F8E2360D45FE103539078799CC0D2A007A49884436F8AE4434B =: public_key
+
+<b
+ swap ref, // config ref
+ 0 32 u, // seqno
+ public_key 256 u,
+ 0 1 u, // Empty vote dict
+b>

@@ -1,0 +1,23 @@
+"TonUtil.fif" include
+
+1667388240 =: now_const // Expired timestamp
+
+// Default validators cell
+<b
+  0x12 8 u,
+  now_const 1000 - 32 u,
+  now_const 100 -  32 u,
+  1 16 u,
+  1 16 u,
+  0 64 u,
+  0 1  u,
+b> hashu
+
+<b
+  0 1 u, // Current elections Maybe Cell
+  0 1 u, // Empty credits:(Hashmap 256 Grams)
+  0 1 u, // Empty past_elections (HashmapE 32 PastElection) ;; index elect_at
+  0 Gram, // nobody balance
+  0 32 u, // active election id
+  swap  256 u, // active_hash hash of the validators cell above
+b>

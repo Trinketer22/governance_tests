@@ -1,0 +1,208 @@
+#include "constants.fc";
+
+{-
+  prod_info#34 utime:uint32 mc_blk_ref:ExtBlkRef state_proof:^(MERKLE_PROOF Block)
+  prod_proof:^(MERKLE_PROOF ShardState) = ProducerInfo;
+
+  These descriptions are not used in elector contract so we can
+  replace ProducerInfo with empty cell.
+
+-}
+
+cell generate_comp_description() impure inline {
+    {-
+     no_blk_gen from_utime:uint32 prod_info:^ProducerInfo = ComplaintDescr;
+    -}
+    return begin_cell().store_uint(now() - (rand(1000) + 1) , 32).store_ref(begin_cell().end_cell()).end_cell();
+}
+
+(int, int) comp_storage_price(slice sc, int expire_in) impure inline_ref {
+    (_, int bits,
+     int refs)       = sc.slice_compute_data_size(4096);
+    var (gas, stack) = invoke_method(complaint_storage_price, [bits, refs, expire_in]);
+
+    return (gas, stack.first());
+}
+
+int in_list?(tuple list, int val) {
+    int found? = false;
+
+    while ( ~ ( found? |   list.null?() ) ) {
+        int cval = list~list_next();
+        found?   = ( cval == val );
+    }
+
+    return found?;
+}
+
+builder generate_complaint_message(int query_id, int elect_id, int pkey, cell descr, int created_at, int severity, int reward_addr, int paid, int fine, int fine_part) impure inline_ref {
+    return generate_internal_message_body(op::new_complaint, query_id).store_uint(elect_id, 32)
+                                                                      .store_uint(0xbc,8)
+                                                                      .store_uint(pkey, 256)
+                                                                      .store_ref(descr)
+                                                                      .store_uint(created_at, 32)
+                                                                      .store_uint(severity, 8)
+                                                                      .store_uint(reward_addr, 256)
+                                                                      .store_grams(paid)
+                                                                      .store_grams(fine)
+                                                                      .store_uint(fine_part, 32);
+
+}
+
+(builder, int, int, int) generate_random_complaint_msg(int query_id, int elect_id, int pub, int reward_addr, int expire_in) impure inline {
+    if ( reward_addr == 0 ) {
+        reward_addr = random();
+    }
+
+    int severity     = rand(256);
+    int created_at   = now();
+    int paid         = 0;
+    int fine_part    = 1 << (rand(11) + 21);
+    cell descr       = generate_comp_description();
+    builder msg_base = generate_complaint_message(query_id, elect_id, pub, descr, created_at, severity, reward_addr, paid, 0, fine_part);
+    slice comp_slice = msg_base.end_cell().begin_parse().skip_bits(32 + 32 + 64);
+
+    (int gas_storage, paid) = comp_storage_price(comp_slice, expire_in);
+    int st_paid             = paid - (1 << 30);
+    ;; Paid field changes in real complaint but price is calculated on intial message. Not sure if that's expected behaviour.
+    int  chash  = generate_complaint_message(query_id, elect_id, pub, descr, created_at, severity, reward_addr, st_paid, 0, fine_part).end_cell()
+                                                                                                                                    .begin_parse().skip_bits(32 + 32 + 64)
+                                                                                                                                   .slice_hash();
+    return (msg_base, paid, chash, gas_storage);
+}
+
+tuple  assert_complaint_msg(int code, slice src, int query_id, int exp_reason, int exp_freeze) impure inline {
+
+    tuple actions = parse_c5();
+    throw_if(code, actions.null?());
+    int msg_mode  = 64;
+    int msg_idx   = 0;
+    if( exp_reason == 0 ) {
+        tuple reserve = actions.at(0);
+        msg_mode = 128;
+        code    += 1;
+        throw_unless(code, actions.tuple_length() == 2);
+        ;; Action type is reserve
+        throw_unless(code + 1, reserve.at(0) == 2);
+        ;; Reserve mode is 4
+        throw_unless(code + 2, reserve.at(2) == 4);
+        code    += 3;
+
+        (int r_amount, cell curr)   = reserve.at(1).unpair();
+        throw_unless(code, r_amount == exp_freeze);
+        msg_idx  = 1;
+    }
+
+   return actions.at(msg_idx).assert_response_msg_from(code, src, msg_mode, op::response::new_complaint + exp_reason, query_id, op::new_complaint, true, false);
+}
+
+tuple assert_complaint_vote_msg(int code, slice src, int query_id, int exp_reason) impure inline {
+    return assert_response_msg(code, src, 64, op::response::vote_result + exp_reason, query_id, op::vote_for_complaint, true, false);
+}
+
+int get_real_fine(int stake, int fine, int fine_part) impure inline {
+    return min(stake, fine + muldiv(stake, fine_part, 1 << 32));
+}
+
+
+
+(cell, cell, int, int) assert_unpack_complaint_status(slice cs, int code) impure inline {
+  throw_unless(code, cs~load_uint(8) == 0x2d);
+  var res = (cs~load_ref(), cs~load_dict(), cs~load_uint(256), cs~load_int(64));
+  throw_unless(code + 1, cs.slice_empty?());
+  return res;
+}
+
+tuple assert_unpack_complaint(slice cs, int code) impure inline {
+  ;; Variation of unpack_complaint function with custom code handling
+  throw_unless(code, cs~load_int(8) == 0xbc - 0x100);
+  tuple res = unsafe_tuple([cs~load_uint(256), cs~load_ref(), cs~load_uint(32), cs~load_uint(8), cs~load_uint(256), cs~load_grams(), cs~load_grams(), cs~load_uint(32)]);
+  throw_unless(code + 1, cs.slice_empty?());
+  return res;
+}
+
+tuple assert_unpack_complaint_full(slice cs, int code) impure inline {
+    var (comp, voters, vset_id, weight) = cs.assert_unpack_complaint_status(code);
+    tuple res_comp = comp.begin_parse().assert_unpack_complaint(code + 2);
+
+    return unsafe_tuple(pair(res_comp, triple(voters,vset_id,weight)));
+}
+
+_ assert_complaint(tuple comp, int code, int pkey, cell descr,
+                     int created_at, int severity, int reward_addr,
+                     int paid, int fine, int fine_part) impure inline_ref {
+
+
+    throw_unless(code + 1, comp.at(0) == pkey);
+    throw_unless(code + 2, comp.at(1).cell_hash() == descr.cell_hash());
+    throw_unless(code + 3, comp.at(2) == created_at);
+    throw_unless(code + 4, comp.at(3) == severity);
+    throw_unless(code + 5, comp.at(4) == reward_addr);
+    throw_unless(code + 6, comp.at(5) == paid);
+    throw_unless(code + 7, comp.at(6) == fine);
+    throw_unless(code + 8, comp.at(7) == fine_part);
+
+
+}
+
+int assert_show_complaint(int code, int elections, int chash,
+                          int pkey, cell descr, int created_at,
+                          int severity, int reward_addr, int paid,
+                          int fine, int fine_part) impure inline {
+
+    var (gas_lookup, stack) = invoke_method(show_complaint, [elections, chash]);
+    tuple comp  = stack.first();
+    throw_if(code, comp.null?());
+    comp        = comp.first();
+    comp.assert_complaint(code, pkey, descr,
+                          created_at, severity, reward_addr,
+                          paid, fine, fine_part);
+
+    return gas_lookup;
+}
+
+int assert_list_complaints(int code, int elections, int chash,
+                           int pkey, cell descr, int created_at,
+                           int severity, int reward_addr, int paid,
+                           int fine, int fine_part) impure inline {
+
+
+    var (gas_lookup, stack) = invoke_method(list_complaints, [elections]);
+    var (found?, comp)      = stack.first().find_by_id(chash);
+    throw_unless(code, found?);
+    comp.at(1).at(0).assert_complaint(code, pkey, descr,
+                          created_at, severity, reward_addr,
+                          paid, fine, fine_part);
+
+    return gas_lookup;
+}
+
+int assert_get_past_complaints(int code, int elections, int chash,
+                               int pkey, cell descr, int created_at,
+                               int severity, int reward_addr, int paid,
+                               int fine, int fine_part) impure inline {
+
+
+    var (gas_lookup, stack) = invoke_method(get_past_complaints, [elections]);
+    cell comp               = stack.first();
+    throw_if(code, comp.null?());
+    var (sc, found?) = comp.udict_get?(256, chash);
+    throw_unless(code + 1, found?);
+    tuple comp  = sc.assert_unpack_complaint_full(code + 2).first();
+    comp.assert_complaint(code, pkey, descr,
+                          created_at, severity, reward_addr,
+                          paid, fine, fine_part);
+
+    return gas_lookup;
+}
+
+builder generate_comp_vote_msg(int query_id, int vidx, int elect_id, int chash, int priv) impure inline_ref {
+    slice head = generate_internal_message_body(op::vote_for_complaint, query_id).end_cell().begin_parse();
+    slice body = begin_cell().store_uint(tag::complaint, 32)
+                             .store_uint(vidx, 16)
+                             .store_uint(elect_id, 32)
+                             .store_uint(chash, 256)
+                            .end_cell().begin_parse();
+
+    return begin_cell().store_slice(head).store_slice(body.sign_data(priv)).store_slice(body);
+}

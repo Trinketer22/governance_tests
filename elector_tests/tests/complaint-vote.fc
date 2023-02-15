@@ -1,0 +1,517 @@
+#include "helpers.fc";
+#include "complaint-helpers.fc";
+#include "constants.fc";
+
+
+(int, int, int, int, int, int, cell, cell) test_complaint_vote_setup() impure inline_ref {
+    default_address();
+    default_config();
+
+    var (gas_before,
+         stake_at)    = announce_test_elections(300);
+    var (gas_elect,
+         _, stakers)  = conduct_valid_elections_verbose(350, stake_at);
+
+    set_c5(get_prev_c5());
+    cell vset         = assert_elections_successfull_msg(400, stake_at);
+
+    ;;  Installing new set
+    set_config_param(config_params::current_validators_set, vset);
+    gas_before += tick_tock(false);
+
+    (_, int set_expire,
+     int total_validators,
+     _, _,
+     cell vdesc)      = vset.parse_vset(500);
+
+    (_, _, _,
+    int stake_held)   = get_validation_times();
+
+    var (idx, vd)     = vdesc.random_elem(16);
+
+    (int pub, _, _)   = vd.parse_vdesc(550);
+
+    ;; Looking up private key by public
+    var (ps, found?)  = stakers.udict_get?(256, pub);
+    throw_unless(601, found?);
+
+    (slice src_addr,
+     int priv)        = (ps~load_msg_addr(), ps~load_uint(256));
+    ;; set_expire + stake_held is escentialy past elections unfreze_at
+    int expire_in     = set_expire + stake_held - now();
+
+    int c_addr        = random();
+    int query_id      = rand(12345) + 1;
+
+    var (new_comp,
+         msg_value,
+         chash,
+         gas_storage)   = generate_random_complaint_msg(query_id, stake_at,
+                                                        pub, c_addr, expire_in);
+    slice comp_addr     = generate_internal_address_with_custom_data(0, -1, c_addr);
+
+    ;; This won't work on new elector (just to highlight the difference)
+    slice vote_addr     = generate_internal_address_with_custom_data(0, 0, c_addr);
+    slice comp_slice    = new_comp.end_cell().begin_parse();
+
+    cell comp_msg       = generate_internal_message_custom(0, msg_value, 0,
+                                                         new_comp, comp_addr,
+                                                         null(), 0);
+    var (gas_comp, _)   = invoke_method(recv_internal, [msg_value, comp_msg, comp_slice]);
+
+    assert_complaint_msg(700, comp_addr, query_id, 0, msg_value - (1 << 30));
+
+    int gas_total = gas_before + gas_elect + gas_storage + gas_comp;
+    return (gas_total, idx, stake_at, chash, priv, c_addr, vset, stakers);
+
+}
+
+int test_complaint_vote_msg(builder vote_body, slice src,
+                        int query_id, int exp_reason,
+                        int exp_fail?) impure inline_ref {
+
+    int gas_vote  = 0;
+    cell vote_msg = generate_internal_message_custom(0, 0, 0,
+                                                           vote_body, src,
+                                                           null(), 0);
+
+    int hash_before = get_data().cell_hash();
+    slice vote_sc = vote_body.end_cell().begin_parse();
+    if ( exp_fail? ) {
+        (int exit, gas_vote, _) = invoke_method_full(recv_internal, [0, vote_msg, vote_sc]);
+        throw_unless(300, exit == exp_fail?);
+        throw_unless(301, hash_before == get_data().cell_hash());
+    }
+    else {
+        (gas_vote, _)   = invoke_method(recv_internal, [0, vote_msg, vote_sc]);
+        assert_complaint_vote_msg(400, src, query_id, exp_reason);
+    }
+
+    int hash_after  = get_data().cell_hash();
+
+    if ( exp_fail? | (exp_reason <= 0) ){
+        throw_unless(500, hash_before == hash_after);
+    }
+    else {
+        throw_unless(500, hash_before != hash_after);
+    }
+
+    return gas_vote;
+}
+
+(int, int, tuple)  assert_complaint_vote(cell participants, int code, cell vset, int pidx,  int elect_id, int chash, int reward_addr) impure inline_ref {
+    (_, _,
+     int total_vldtrs, _,
+     int total_weight,
+     cell vdesc)       = vset.parse_vset(code);
+
+     int vset_hash     = vset.cell_hash();
+     int vote_weight   = 0;
+     int gas_vote      = 0;
+     int weight_req    = muldiv(total_weight, 2, 3);
+     int exp_res       = vote_result::accepted;
+     tuple comp_res    = empty_tuple();
+
+     ;; Looking up public key of validator in question
+     (int pkey, _, _)  = vdesc.pick_vdesc(code + 50, pidx);
+
+     ;; Removing the validator in question from voters
+     vdesc~udict_delete?(16, pidx);
+
+     tuple voters_list = null();
+
+     do {
+
+         var (cur_idx, vs)    = vdesc.random_elem(16);
+         voters_list          = cons(cur_idx, voters_list);
+         ;; Maybe move it to the helper?
+         vdesc~udict_delete?(16, cur_idx);
+
+         var (pub, weight, _) = vs.parse_vdesc(code + 100);
+         vote_weight         += weight;
+
+         var (pt, found?) = participants.udict_get?(256, pub);
+         throw_unless(code + 3, found?);
+         (slice src_addr,
+          int priv)       = (pt~load_msg_addr(), pt~load_uint(256));
+
+         int query_id     = rand(12345) + 1;
+         var vote_body    = generate_comp_vote_msg(query_id, cur_idx,
+                                                   elect_id, chash, priv);
+
+         if ( vote_weight >= weight_req ) {
+             exp_res = vote_result::finished;
+         }
+
+         int gas_submit = vote_body.test_complaint_vote_msg(src_addr,
+                                                            query_id,
+                                                            exp_res,
+                                                            false);
+
+         ;; Checking complaint state every step of the way
+         var (gas_lookup, stack) = invoke_method(show_complaint, [elect_id, chash]);
+         comp_res                = stack.at(0);
+
+         throw_unless(code + 4, comp_res.at(1).in_list?(cur_idx));
+         throw_unless(code + 5, vset_hash == comp_res.at(2));
+         throw_unless(code + 6, weight_req - vote_weight == comp_res.at(3));
+
+         gas_vote += gas_lookup;
+
+    } until( vote_weight >= weight_req );
+
+    return (gas_vote, weight_req - vote_weight, voters_list) ;
+}
+
+int __test_complaint_vote_wrong_tag() {
+
+    var (gas_init, idx, elect_id, chash, priv, _, _, _) = test_complaint_vote_setup();
+    int query_id        = rand(12345) + 1;
+    slice vote_addr     = generate_internal_address();
+    ;; Valid message
+    builder comp_vote   = generate_comp_vote_msg(query_id, idx, elect_id, chash, priv);
+    ;; Random tag
+    int     tag         = 0;
+    do {
+        tag = rand(1 << 32);
+    } until( tag != tag::complaint );
+
+    ;; Appending invalid tag to valid msg.
+    slice   msg_sc       = comp_vote.end_cell().begin_parse();
+    ;; op + query_id + signature
+    var (tail, head)     = msg_sc.load_bits(32 + 64 + 512);
+    builder tag_mismatch = begin_cell().store_slice(head)
+                                       .store_uint(tag, 32)
+                                       .store_slice(tail.skip_bits(32));
+    int exception_code   = error::complaint_vote::tag_mismatch;
+
+    int gas_fail         = tag_mismatch.test_complaint_vote_msg(vote_addr,
+                                                                query_id, 0,
+                                                                exception_code);
+    int gas_success      = comp_vote.test_complaint_vote_msg(vote_addr,
+                                                             query_id,
+                                                             vote_result::accepted,
+                                                             false);
+    return gas_init + gas_fail + gas_success;
+}
+
+int __test_complaint_vote_invalid_signature() {
+
+    var (gas_init, idx, elect_id, chash, priv, _, _, _) = test_complaint_vote_setup();
+    int query_id       = rand(12345) + 1;
+    slice vote_addr    = generate_internal_address();
+    ;; invalid private key
+    int bad_priv       = priv.generate_different();
+    var fail_vote      = generate_comp_vote_msg(query_id, idx, elect_id, chash, bad_priv);
+    int exception_code = error::complaint_vote::sig_mismatch;
+    int vote_accepted    = 1;
+
+    int gas_fail       = fail_vote.test_complaint_vote_msg(vote_addr,
+                                                            query_id, 0,
+                                                            exception_code);
+
+    var success_vote   = generate_comp_vote_msg(query_id, idx, elect_id, chash, priv);
+    int gas_success    = success_vote.test_complaint_vote_msg(vote_addr,
+                                                              query_id,
+                                                              vote_result::accepted,
+                                                              false);
+    return gas_init + gas_fail + gas_success;
+}
+
+int __test_complaint_vote_no_such_complaint() {
+
+    var (gas_init, idx, elect_id, chash, priv, _, _, _) = test_complaint_vote_setup();
+    int query_id       = rand(12345) + 1;
+    slice vote_addr    = generate_internal_address();
+    ;; invalid complaint hash
+    int bad_comp       = chash.generate_different();
+
+    var fail_vote      = generate_comp_vote_msg(query_id, idx, elect_id, bad_comp, priv);
+
+    int gas_fail       = fail_vote.test_complaint_vote_msg(vote_addr,
+                                                            query_id,
+                                                            vote_result::bad_comp_hash,
+                                                            false);
+
+    var success_vote   = generate_comp_vote_msg(query_id, idx, elect_id, chash, priv);
+    int gas_success    = success_vote.test_complaint_vote_msg(vote_addr,
+                                                              query_id,
+                                                              vote_result::accepted,
+                                                              false);
+
+    return gas_init + gas_fail + gas_success;
+}
+
+int __test_complaint_vote_no_such_elections() {
+
+    var (gas_init, idx, elect_id, chash, priv, _, _, _) = test_complaint_vote_setup();
+    int query_id       = rand(12345) + 1;
+    slice vote_addr    = generate_internal_address();
+    ;; Generating bad elections id
+    int bad_elect      = 0;
+
+    do {
+        bad_elect = rand(1 << 32);
+    } until ( bad_elect != elect_id );
+
+    var fail_vote      = generate_comp_vote_msg(query_id, idx, bad_elect, chash, priv);
+
+    int gas_fail       = fail_vote.test_complaint_vote_msg(vote_addr,
+                                                            query_id,
+                                                            vote_result::wrong_elections,
+                                                            false);
+
+
+    var success_vote   = generate_comp_vote_msg(query_id, idx, elect_id, chash, priv);
+    int gas_success    = success_vote.test_complaint_vote_msg(vote_addr,
+                                                              query_id,
+                                                              vote_result::accepted,
+                                                              false);
+
+    return gas_init + gas_fail + gas_success;
+}
+
+int __test_complaint_voted_already() {
+
+    var (gas_init, idx, elect_id, chash, priv, _, _, _) = test_complaint_vote_setup();
+    int query_id       = rand(12345) + 1;
+    slice vote_addr    = generate_internal_address();
+
+    var success_vote   = generate_comp_vote_msg(query_id, idx, elect_id, chash, priv);
+    ;; First atempt succeed
+    int gas_success    = success_vote.test_complaint_vote_msg(vote_addr,
+                                                              query_id,
+                                                              vote_result::accepted,
+                                                              false);
+
+    int gas_fail       = success_vote.test_complaint_vote_msg(vote_addr,
+                                                              query_id,
+                                                              vote_result::already_voted,
+                                                              false);
+
+    return gas_init + gas_fail + gas_success;
+}
+
+int __test_complaint_vote_old_vset_finished() {
+    {-
+      This case happens when vote is sent on complaint
+      that was relevant for the previously active vset
+      which already collected 2/3 of the votes.
+    -}
+
+    var (gas_init, vidx, elect_id,
+         chash, priv, reward_addr,
+         vset, stakers)  = test_complaint_vote_setup();
+
+    (_, _,
+     int total_vldtrs, _,
+     int total_weight,
+     cell vdesc)         = vset.parse_vset(200);
+
+    ;; Conduct voting till 2/3 is collected.
+    var (gas_vote,
+         weight_expected,
+         vlist)          = stakers.assert_complaint_vote(400, vset,
+                                                         vidx, elect_id,
+                                                         chash, reward_addr);
+
+    {-
+      Now vset is changed.
+      same vdesc for simplicity, but expirey times are going to be different
+      so vset_id will change
+    -}
+
+    cell next_vset  = new_vset(total_vldtrs, total_weight, vdesc);
+    set_config_param(config_params::current_validators_set, next_vset);
+    int gas_tt   = tick_tock(false);
+
+    ;; Some slow poke still votes on that complaint
+    int query_id    = rand(12345) + 1;
+    slice vote_addr = generate_internal_address();
+    var late_vote   = generate_comp_vote_msg(query_id, vidx, elect_id, chash, priv);
+
+    int gas_fail    = late_vote.test_complaint_vote_msg(vote_addr,
+                                                        query_id,
+                                                        vote_result::old_vset,
+                                                        false);
+    return gas_init + gas_vote + gas_tt + gas_fail;
+}
+
+int __test_complaint_vote_old_reset() {
+    {-
+      This case is similar to previous but
+      complaint vote didn't succeed (got < 2/3 weight).
+      Complaint changes the active vset id and resets the vote counter.
+      https://github.com/ton-blockchain/ton/blob/master/crypto/smartcont/elector-code.fc#L557
+    -}
+
+    var (gas_init, vidx, elect_id,
+         chash, priv, reward_addr,
+         vset, stakers)  = test_complaint_vote_setup();
+
+    (_, _,
+     int total_vldtrs, _,
+     int total_weight,
+     cell vdesc)         = vset.parse_vset(200);
+
+     int weight_req      = muldiv(total_weight, 2, 3);
+     ;; Let's say complaint only received up to 10 votes
+     int votes_count     = rand(10) + 1;
+     int vote_weight     = 0;
+     int cur_weight      = 0;
+     int gas_vote        = 0;
+     int query_id        = 0;
+     int end_loop?       = false;
+
+     do {
+        var (idx, vd)             = vdesc.random_elem(16);
+        var (pub, cur_weight, _)  = vd.parse_vdesc(250);
+
+        ;; Make sure complaint won't get accepted
+        vote_weight += cur_weight;
+        end_loop?    = (vote_weight >= weight_req );
+
+        if (~ end_loop?) {
+
+            var (ps, found?)  = stakers.udict_get?(256, pub);
+            throw_unless(300, found?);
+
+            (slice src_addr,
+             int priv)        = (ps~load_msg_addr(), ps~load_uint(256));
+            query_id          = rand(12345) + 1;
+            var new_vote      = generate_comp_vote_msg(query_id, idx,
+                                                       elect_id, chash, priv);
+
+            int gas_submit    = new_vote.test_complaint_vote_msg(src_addr,
+                                                                 query_id,
+                                                                 vote_result::accepted,
+                                                                 false);
+            gas_vote += gas_submit;
+            ;; Removing already voted from vdesc
+            vdesc~udict_delete?(16, idx);
+        }
+
+        votes_count -= 1;
+    } until ( (votes_count == 0) | end_loop?  );
+
+    ;; Same deal as in previous test. vset is changed.
+    cell next_vset  = new_vset(total_vldtrs, total_weight, vdesc);
+    set_config_param(config_params::current_validators_set, next_vset);
+    int gas_tt   = tick_tock(false);
+
+    ;; Now pick random voter that not voted already (we removed those from vdesc)
+    var (idx, voter) = vdesc.random_elem(16);
+    var (pub, new_weight, _)  = voter.parse_vdesc(350);
+
+    var (ps, found?)  = stakers.udict_get?(256, pub);
+    throw_unless(400, found?);
+
+    (slice src_addr,
+     int priv)       = (ps~load_msg_addr(), ps~load_uint(256));
+
+    var late_vote    = generate_comp_vote_msg(query_id, idx, elect_id, chash, priv);
+
+    int gas_reset    = late_vote.test_complaint_vote_msg(src_addr,
+                                                          query_id,
+                                                          vote_result::accepted,
+                                                          false);
+    var (gas_after, stack) = invoke_method(show_complaint, [elect_id, chash]);
+
+    {-
+      We expect vote reset on new vset.
+      1) Change of vote_id
+      2) Accumulated weight to be equal to new_weight instead of vote_weight
+      3) Voters list to contain only last voter idx
+    -}
+
+    tuple comp_res = stack.first();
+    throw_unless(500, comp_res.at(2) == next_vset.cell_hash());
+    throw_unless(501, comp_res.at(3) == weight_req - new_weight);
+
+    tuple vlist    = comp_res.at(1);
+    throw_unless(502, idx == vlist~list_next());
+    ;; Should be the only element
+    throw_unless(503, vlist.null?());
+
+    return gas_init + gas_vote + gas_reset;
+}
+
+int __test_complaint_successfull_vote() {
+
+    ;; In this test we need vset and their priv keys to submit votes
+    var (gas_init, vidx, elect_id,
+         chash, _, reward_addr,
+         vset, stakers) = test_complaint_vote_setup();
+
+
+    (_, _,
+     int total_vldtrs, _,
+     int total_weight,
+     cell vdesc)       = vset.parse_vset(200);
+
+     int vset_hash     = vset.cell_hash();
+     tuple comp_res    = empty_tuple();
+
+     var (gas_past, stack) = invoke_method(past_elections, []);
+     var (found?, elects)  = stack.at(0).find_by_id(elect_id);
+     throw_unless(300, found?);
+
+     ;; Looking up public key of validator in question
+     (int pkey, _, _)       = vdesc.pick_vdesc(301, vidx);
+
+     ;; We need frozen to look up validator in question stake
+     cell frozen           = elects.at(4);
+     var (found?, _, _,
+          stake, _)        = frozen.load_frozen(pkey);
+     throw_unless(302, found?);
+
+     ;; Credit on reward address before vote complete (if any)
+     var (gas_credit, credit) = compute_return_helper(reward_addr);
+     ;; This will verify successfull vote messages and states till end of vote.
+     var (gas_vote,
+          weight_expected,
+          vlist)              = stakers.assert_complaint_vote(400, vset,
+                                                              vidx, elect_id,
+                                                              chash, reward_addr);
+
+    ;; We still have to verify state impact after the validator punished.
+    var (gas_lookup, stack) = invoke_method(show_complaint, [elect_id, chash]);
+
+    comp_res        = stack.at(0);
+    tuple complaint = comp_res.at(0);
+    tuple voters    = comp_res.at(1);
+
+    ;; Not really necessery since we check state each message i guess
+    while( ~ vlist.null?() ) {
+        int vid = vlist~list_next();
+        throw_unless(303, voters.in_list?(vid));
+    }
+
+    throw_unless(304, vset.cell_hash() == comp_res.at(2));
+    throw_unless(305, weight_expected  == comp_res.at(3));
+
+    ;; Now checking the complaint part
+    int paid        = complaint.at(5);
+    int fine        = complaint.at(6);
+    int fine_part   = complaint.at(7);
+    int true_fine   = stake.get_real_fine(fine, fine_part);
+    ;; Expected reward
+    int reward      = min(true_fine >> 3, paid * 8);
+    var (gas_credit,
+    credit_after)   = compute_return_helper(reward_addr);
+    ;; Reward should add to current credit
+    throw_unless(307, credit_after == credit + reward);
+
+    ;; Looking up frozen again, to verify stake change
+    var (gas_after, stack) = invoke_method(past_elections, []);
+    (found?, elects)       = stack.at(0).find_by_id(elect_id);
+    throw_unless(308, found?);
+
+    frozen                 = elects.at(4);
+    var (_, _, _,
+         stake_after, _)   = frozen.load_frozen(pkey);
+
+    ;; Checking that stake decreased by fine value
+    throw_unless(309, stake_after == stake - true_fine);
+    return gas_init + gas_vote + gas_past;
+}

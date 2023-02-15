@@ -1,0 +1,395 @@
+#include "constants.fc";
+#include "helpers.fc";
+#include "test-wraps.fc";
+
+int __test_proposal_hash_mismatch() {
+    default_config();
+
+    cell  config     = get_config();
+    int   idx        = 0; rand(41);
+
+    cell param_val   = null();
+    ;; We need not null value
+    do {
+        (_, idx, param_val) = config.random_elem_ref(32, true, true);
+    } until ( ~ param_val.null?() );
+
+    int  critical?   = is_critical?(idx);
+
+    int  param_hash  = param_val.cell_hash();
+    int  inv_hash    = param_hash.generate_different(256, false);
+    int  exp_code    = error::proposal::old_mismatch;
+    ;; These two val ues 0 means get correct values during test
+    int  expire_in   = 0;
+    int  ton_amount  = 0;
+
+    cell new_val     = begin_cell().store_uint(random(), 256).end_cell();
+    (int gas_fail, _)    = test_new_proposal(new_val, 300,
+                                             idx, critical?,
+                                             exp_code, expire_in,
+                                             ton_amount, inv_hash);
+
+    ;; Should succeed with correct hash
+    exp_code         = op::response::proposal_accepted;
+    (int gas_success, _) = test_new_proposal(new_val, 400,
+                                             idx, critical?,
+                                             exp_code, expire_in,
+                                             ton_amount, param_hash);
+
+    return gas_fail + gas_success;
+}
+
+int __test_proposal_mandatory_null() {
+    ;; Case where we atempt to nullify mandatory parameter
+
+    default_config();
+
+    cell  config     = get_config();
+    cell  param_val  = null();
+
+    cell m_params = config_param(config_params::mandatory_params);
+
+    (_, int idx, _)  = m_params.random_elem(32, true);
+
+    int critical?  = is_critical?(idx);
+    int param_hash = -1; ;; Nullify
+
+    int exp_code   = error::proposal::mandatory_nullified;
+
+    int expire_in  = 0;
+    int ton_amount = 0;
+
+    cell new_val   = null(); ;;begin_cell().store_uint(random(), 256).end_cell();
+
+    (int gas_fail, _)  = test_new_proposal(new_val, 300,
+                                           idx, critical?,
+                                           exp_code, expire_in,
+                                           ton_amount, param_hash);
+
+    ;; Picking any other param idx that is not mandatory
+    do {
+        idx = rand(41);
+        (_, int f?) = m_params.udict_get?(32, idx);
+    } until ( ~ f? );
+
+    ;; Should succeed with non-mandatory param
+    exp_code        = op::response::proposal_accepted;
+    critical?       = is_critical?(idx);
+    (int gas_success, _) = test_new_proposal(new_val, 400,
+                                             idx, critical?,
+                                             exp_code, expire_in,
+                                             ton_amount, param_hash);
+
+    return gas_fail + gas_success;
+}
+
+int __test_proposal_too_deep() {
+
+    default_config();
+
+    var (_, idx, param_val) = get_config().random_elem_ref(32, true, true);
+
+    int  critical?   = is_critical?(idx);
+
+    int  param_hash  = param_val.null?() ? -1 : param_val.cell_hash();
+    int  exp_code    = error::proposal::too_deep;
+
+    ;; These two val ues 0 means get correct values during test
+    int  expire_in   = 0;
+    int  ton_amount  = 0;
+    int  depth       = rand(10) + 128;
+
+    cell new_val     = begin_cell().store_uint(random(), 256).end_cell();
+
+    repeat( depth ) {
+        cell deep_r = begin_cell().store_ref(new_val).end_cell();
+        new_val     = deep_r;
+    }
+
+    (int gas_fail, _)    = test_new_proposal(new_val, 300,
+                                             idx, critical?,
+                                             exp_code, expire_in,
+                                             ton_amount, param_hash);
+
+    ;; Let's try 128 < depth >= 10
+    exp_code = op::response::proposal_accepted;
+    new_val  = begin_cell().store_uint(random(), 256).end_cell();
+    depth    = rand(118) + 10;
+
+    repeat( depth ) {
+        cell deep_r = begin_cell().store_ref(new_val).end_cell();
+        new_val     = deep_r;
+    }
+
+    (int gas_success, _)  = test_new_proposal(new_val, 400,
+                                              idx, critical?,
+                                              exp_code, expire_in,
+                                              ton_amount, param_hash);
+
+    return gas_fail + gas_success;
+}
+
+int __test_proposal_critical_missing() {
+
+    default_config();
+
+    cell crit_params = config_param(config_params::critical_params);
+
+    (_, int idx, _)  = crit_params.random_elem(32, true);
+    cell param_val   = config_param(idx);
+    int param_hash   = param_val.null?() ? -1 : param_val.cell_hash();
+
+    int  critical?   = false;
+    int  exp_code    = error::proposal::critical_flag_missing;
+
+    cell new_val     = begin_cell().store_uint(random(), 256).end_cell();
+
+    ;; These two val ues 0 means get correct values during test
+    int  expire_in   = 0;
+    int  ton_amount  = 0;
+
+    (int gas_fail, _)    = test_new_proposal(new_val, 300,
+                                             idx, critical?,
+                                             exp_code, expire_in,
+                                             ton_amount, param_hash);
+
+    ;; Try with correct critical flag value
+    critical? = true;
+    exp_code  = op::response::proposal_accepted;
+
+    (int gas_success, _)  = test_new_proposal(new_val, 400,
+                                              idx, critical?,
+                                              exp_code, expire_in,
+                                              ton_amount, param_hash);
+
+
+    return gas_fail + gas_success;
+}
+
+int __test_proposal_min_storage_time() {
+    default_config();
+
+    var (_, idx, param_val) = get_config().random_elem_ref(32, true, true);
+
+    int  critical?   = is_critical?(idx);
+    int  param_hash  = param_val.null?() ? -1 : param_val.cell_hash();
+    cell new_val     = begin_cell().store_uint(random(), 256).end_cell();
+    int  exp_code    = error::proposal::expired;
+
+    var (expire_min, _) = get_vote_store_sec(critical?);
+    ;; From 1 to minimal exire_in - 1
+    int  expire_in   = rand( expire_min - 1 ) + 1;
+    ;; Setting large ton amount because we can't get calculation below min from contract
+    int  ton_amount  = 100 * ONECOIN;
+
+    (int  gas_fail, _)    = test_new_proposal(new_val, 300,
+                                              idx, critical?,
+                                              exp_code, expire_in,
+                                              ton_amount, param_hash);
+
+    ;; Trying with correct expire time
+    exp_code   = op::response::proposal_accepted;
+    expire_in  = expire_min;
+    ton_amount = 0;
+
+    (int  gas_success, _) = test_new_proposal(new_val, 400,
+                                              idx, critical?,
+                                              exp_code, expire_in,
+                                              ton_amount, param_hash);
+
+    return gas_fail + gas_success;
+}
+
+int __test_proposal_success() {
+    default_config();
+
+    int try_iter  = rand(3) + 2 + 1; ;; From 2 to 5 times to make use of prop list
+    int gas_total = 0;
+
+    int  exp_code = op::response::proposal_accepted;
+    cell config   = get_config();
+
+    repeat( try_iter ) {
+        var (_, idx, param_val) = config.random_elem_ref(32, true, true);
+        ;; Making sure no update clash
+        config~idict_delete?(32, idx);
+
+        int critical? = is_critical?(idx);
+        int  param_hash  = param_val.null?() ? -1 : param_val.cell_hash();
+        cell new_val     = begin_cell().store_uint(random(), 256).end_cell();
+
+        int  expire_in   = get_random_store_time(critical?);
+        int  ton_amount  = 0;
+
+        var (gas_submit, prop_hash)  = test_new_proposal(new_val, 400,
+                                                         idx, critical?,
+                                                         exp_code, expire_in,
+                                                         ton_amount, param_hash);
+        var (gas_prop, stack) = invoke_method(get_proposal, [prop_hash]);
+
+        gas_total += gas_submit + gas_prop;
+
+        tuple prop = stack.first();
+
+        cell vset = config_param(config_params::current_validators_set);
+
+        prop.assert_proposal_val(500, expire_in, critical?,
+                                 idx, new_val, param_hash,
+                                 vset, null(), 0, 0);
+
+        ;; Now let's test that prop list returns same thing
+        var (gas_plist, stack) = invoke_method(list_proposals, []);
+
+        gas_total += gas_plist;
+
+        (int found?, prop) = stack.first().find_by_id(prop_hash);
+        throw_unless(550, found?);
+        ;; First is the phash, so skip it
+        prop = prop.second();
+        prop.assert_proposal_val(600, expire_in, critical?,
+                                 idx, new_val, param_hash,
+                                 vset, null(), 0, 0);
+    }
+
+    return gas_total;
+}
+
+int __test_proposal_update_critical_missmatch() {
+    default_config();
+
+    cell config      = get_config();
+    cell crit_params = config_param(config_params::critical_params);
+
+
+    cell param_val   = null();
+    int  idx         = 0;
+
+    ;; Non critical param required, not optimal but works
+    do {
+        (_, idx, param_val)  = config.random_elem_ref(32, true, true);
+        (_, int f?)          = crit_params.idict_get?(32, idx);
+    } until ( ~ f? );
+
+    int exp_code     = op::response::proposal_accepted;
+    int param_hash   = param_val.null?() ? -1 : param_val.cell_hash();
+    int critical?    = false;
+    int expire_nc    = get_random_store_time(critical?);
+    cell new_val     = begin_cell().store_uint(random(), 256).end_cell();
+
+    var (gas_st, int ton_nc) = new_val.get_prop_storage_price(expire_nc, critical?);
+
+    var (gas_submit, prop_hash)  = test_new_proposal(new_val, 400,
+                                                     idx, critical?,
+                                                     exp_code, expire_nc,
+                                                     ton_nc, param_hash);
+    ;; Changing critical flag
+    critical? = true;
+
+    ;; Adjust expire and ton amount values accordingly to the new status
+    int expire_crit             = get_random_store_time(critical?);
+    var (gas_st2, int ton_crit) = new_val.get_prop_storage_price(expire_crit, critical?);
+
+    ;; Should still fail, because we can't change crit flag of existing proposal
+    exp_code  = error::proposal::critical_flag_mismatch;
+
+    var (gas_fail, prop_hash)    = test_new_proposal(new_val, 500,
+                                                     idx, critical?,
+                                                     exp_code, expire_crit,
+                                                     ton_crit, param_hash);
+
+    ;; Checking that error changes on changing critical back to normal
+    critical?  = false;
+    exp_code   = error::proposal::already_exists;
+
+    var (gas_exits, prop_hash)   = test_new_proposal(new_val, 600,
+                                                     idx, critical?,
+                                                     exp_code, expire_nc,
+                                                     ton_nc, param_hash);
+
+
+
+    return gas_st + gas_st2 + gas_submit + gas_fail + gas_exits;
+}
+
+int __test_proposal_update_already_exists() {
+
+    {-
+      Proposal expiery time should increase
+      otherwise error::proposal::already_exists raised
+    -}
+
+    default_config();
+
+    var (_, idx, param_val) = get_config().random_elem_ref(32, true, true);
+
+
+    int exp_code   = op::response::proposal_accepted;
+    int critical?  = is_critical?(idx);
+    int expire_in  = get_random_store_time(critical?);
+    int param_hash = param_val.null?() ? -1 : param_val.cell_hash();
+
+    cell new_val   = begin_cell().store_uint(random(), 256).end_cell();
+    var (gas_st, int ton_before) = new_val.get_prop_storage_price(expire_in, critical?);
+
+
+    var (gas_submit, prop_hash)  = test_new_proposal(new_val, 400,
+                                                     idx, critical?,
+                                                     exp_code, expire_in,
+                                                     ton_before, param_hash);
+
+
+    ;; Expect already exist since no time passed
+    exp_code   = error::proposal::already_exists;
+    var (gas_fail, prop_hash)  = test_new_proposal(new_val, 500,
+                                                     idx, critical?,
+                                                     exp_code, expire_in,
+                                                     ton_before, param_hash);
+
+    ;; Wait some time
+    int wait_time = rand(90) + 10 + 1;
+    wait_till(now() + wait_time);
+
+    ;; Making storage price re-calculation
+    int pps       = ton_before / expire_in;
+    int ton_after = pps * (wait_time + recalc_penalty);
+
+    ;; Testing fee edge case
+    int ton_less  = ton_after - 1;
+    exp_code = error::proposal::insufficient_fee;
+    var (gas_low, _)              = test_new_proposal(new_val, 600,
+                                                      idx, critical?,
+                                                      exp_code, expire_in,
+                                                      ton_less, param_hash);
+
+    ;; Expecting proposal update acceptance
+    exp_code = op::response::proposal_accepted;
+    var (gas_success, prop_hash)  = test_new_proposal(new_val, 700,
+                                                      idx, critical?,
+                                                      exp_code, expire_in,
+                                                      ton_after, param_hash);
+
+
+    ;; Now let's test get methods
+    var (gas_prop, stack) = invoke_method(get_proposal, [prop_hash]);
+
+    tuple prop = stack.first();
+
+    cell vset = config_param(config_params::current_validators_set);
+
+    prop.assert_proposal_val(700, expire_in, critical?,
+                             idx, new_val, param_hash,
+                             vset, null(), 0, 0);
+
+    ;; Now let's test that prop list returns same thing
+    var (gas_plist, stack) = invoke_method(list_proposals, []);
+
+    (int found?, prop) = stack.first().find_by_id(prop_hash);
+    throw_unless(750, found?);
+    ;; First is the phash, so skip it
+    prop = prop.second();
+    prop.assert_proposal_val(800, expire_in, critical?,
+                             idx, new_val, param_hash,
+                             vset, null(), 0, 0);
+
+    return gas_submit + gas_fail + gas_low + gas_success + gas_prop + gas_plist;
+}

@@ -1,0 +1,7 @@
+*.pk
+*.swp
+build/*.fif
+build/*.json
+build/boc/*.fif
+build/boc/*.json
+build/boc/*.boc

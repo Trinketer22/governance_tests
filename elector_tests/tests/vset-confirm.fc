@@ -1,0 +1,312 @@
+#include "helpers.fc";
+{-
+  It's odd to test validators set
+  confirmation messages.
+  In most cases except one (validators set rejected)
+  nothing is changed.
+  I guess i still have to map those out.
+-}
+
+int test_vset_confirm(int code, slice addr, int stake_at, int op, int expect_fail?) impure method_id {
+
+
+    ;; Saving hash so we can check that nothing has changed in state.
+    int data_hash      = get_data().cell_hash();
+    ;; Elections id comes as query_id
+    builder msg_body   = generate_internal_message_body(op, stake_at);
+    slice   body_slice = msg_body.end_cell().begin_parse();
+    cell msg           = generate_internal_message_custom(0, 0, 0,
+                                                          msg_body, addr,
+                                                          null(), 0);
+    (int gas_reject, _)  = invoke_method(recv_internal, [0, msg, body_slice]);
+
+    if ( expect_fail? | (op == op::response::update_vset_confirm) ) {
+        ;; No actions
+        assert_no_actions();
+        ;; Nothing should change.
+        throw_unless(code + 1, data_hash == get_data().cell_hash());
+    }
+    else {
+
+        {-
+          Data should change.
+          Effect of this change we're going to test
+          in positive testcase.
+        -}
+        throw_unless(code + 2, data_hash != get_data().cell_hash());
+    }
+
+    return gas_reject;
+
+}
+
+int test_vset_confirm_accept(int gl, int code,
+                             slice addr, int stake_at,
+                             int op, int expect_fail?) {
+
+    {-
+      test_vset_confirm wrapper aimed to detect
+      accept_message call by comparing before
+      call and after values of gas limit.
+    -}
+
+    int gas = test_vset_confirm(code, addr, stake_at, op, expect_fail?);
+    int gl_after = get_gl();
+
+    if (expect_fail?) {
+        throw_unless(code + 50, gl_after == gl);
+    }
+    else {
+        throw_unless(code + 51, gl_after > gl);
+    }
+
+    return gas;
+}
+
+int __test_vset_rejected_not_config() {
+
+    default_address();
+    default_config();
+
+    var (gas_before,
+         stake_at)     = announce_test_elections(300);
+    int gas_elect      = conduct_valid_elections(400);
+    int config_addr    = config_param(config_params::config_address).begin_parse()
+                                                                    .preload_uint(256);
+    slice correct_addr = generate_internal_address_with_custom_data(0, -1, config_addr);
+    slice non_config   = generate_different_address(-1, correct_addr);
+    int op             = op::response::update_vset_reject;
+
+    int gas_fail       = test_vset_confirm(500, non_config,   stake_at, op, true);
+    int gas_success    = test_vset_confirm(600, correct_addr, stake_at, op, false);
+
+    return gas_before + gas_elect + gas_fail + gas_success;
+}
+
+int __test_vset_rejected_wrong_wc() {
+
+    {-
+      This test is pretty much identical to the previous one.
+      I guess it makes sense to join those in one case.
+      But i would have to set c4 back to pre case state.
+      So cleanest way is to separate those and suffer
+      through another elections.
+      I beleive it would be nice to have __before __before_each kind of
+      procedures in toncli so we can for example get to the desired state
+      once, and then run a bunch of test cases.
+    -}
+
+    default_address();
+    default_config();
+
+    var (gas_before,
+         stake_at)     = announce_test_elections(300);
+    int gas_elect      = conduct_valid_elections(400);
+    int config_addr    = config_param(config_params::config_address).begin_parse()
+                                                                    .preload_uint(256);
+
+    slice correct_addr = generate_internal_address_with_custom_data(0, -1, config_addr);
+    ;; Only difference is wc
+    slice wrong_wc     = generate_internal_address_with_custom_data(0,  0, config_addr);
+
+    int op             = op::response::update_vset_reject;
+    int gas_fail       = test_vset_confirm(500, wrong_wc,     stake_at, op, true);
+    int gas_success    = test_vset_confirm(600, correct_addr, stake_at, op, false);
+
+    return gas_before + gas_elect + gas_fail + gas_success;
+
+}
+
+int __test_vset_rejected_wrong_elections() {
+
+    default_address();
+    default_config();
+
+    var (gas_before,
+         stake_at)     = announce_test_elections(300);
+    int gas_elect      = conduct_valid_elections(400);
+    int config_addr    = config_param(config_params::config_address).begin_parse()
+                                                                    .preload_uint(256);
+    int delta          = rand(12345) + 1;
+    int bad_elect      = rand(2) ? stake_at + delta : stake_at - delta;
+    slice correct_addr = generate_internal_address_with_custom_data(0, -1, config_addr);
+
+    int op             = op::response::update_vset_reject;
+    int gas_fail       = test_vset_confirm(500, correct_addr, bad_elect, op, true);
+    int gas_success    = test_vset_confirm(600, correct_addr, stake_at,  op, false);
+
+    return gas_before + gas_elect + gas_fail + gas_success;
+
+}
+
+int __test_vset_rejected_success() {
+    default_address();
+    default_config();
+
+    var (gas_before,
+         stake_at)     = announce_test_elections(300);
+    int gas_elect      = conduct_valid_elections(400);
+    int gas_lookup     = 0;
+
+    var (gas_past, stack) = invoke_method(past_elections, []);
+    var (found_past?,
+         cur_elections)   = stack.first().find_by_id(stake_at);
+
+    throw_unless(303, found_past?);
+
+    cell frozen_before = cur_elections.at(4);
+    tuple unfreeze_exp = null();
+    int idx            = (1 << 255) + ((1 << 255) - 1);
+
+    do {
+        (idx, slice cs, int found?) = frozen_before.udict_get_prev?(256, idx);
+
+        if ( found? ) {
+            int addr = cs~load_uint(256);
+            cs~skip_bits(64);
+            int stake = cs~load_grams();
+
+            var (gas_credit, credit) = compute_return_helper(addr);
+            ;; We expect that frozen stake will be added to credit on unfreeze.
+            unfreeze_exp = cons(pair(addr, credit + stake), unfreeze_exp);
+            gas_lookup += gas_credit;
+        }
+
+    } until(~ found?);
+
+    int config_addr    = config_param(config_params::config_address).begin_parse()
+                                                                    .preload_uint(256);
+    slice correct_addr = generate_internal_address_with_custom_data(0, -1, config_addr);
+
+    int op             = op::response::update_vset_reject;
+    int gas_success    = test_vset_confirm(500, correct_addr, stake_at, op, false);
+    ;; After this everything should get unfrozen -> creditated.
+
+    do {
+        (int addr, int exp)      = unfreeze_exp~list_next().unpair();
+        var (gas_credit, credit) = compute_return_helper(addr);
+
+        ;; Credit should equal expected credit
+        throw_unless(304, credit == exp);
+        gas_lookup += gas_credit;
+    } until( unfreeze_exp.null?() );
+
+
+    var (gas_after, stack) = invoke_method(past_elections, []);
+
+    (found_past?, _) = stack.first().find_by_id(stake_at);
+
+    ;; Past elections with current id should be removed on unfreeze.
+    throw_if(305, found_past?);
+
+    return gas_before + gas_elect + gas_success + gas_lookup + gas_after;
+}
+
+{-
+  Here comes a bit of nonsense.
+  On successfull vset confirmation nothing happens.
+  But i feel like it still has to be covered.
+  So i'm going to eveluate success based
+  on accept_message and increase of gas limit.
+  I guess there is better way to do it. 
+  Since only difference between reject and confirm
+  cases is op_code, maybe it would be better to test
+  both in single case.
+  But i'll stick to separate cases for now.
+-}
+
+int rand_gl() impure inline_ref {
+    int gl     = get_gl();
+    int rnd_gl = gl - (rand(gl / 10) + 1);
+    set_gas_limit(rnd_gl);
+    return rnd_gl;
+}
+
+int __test_vset_confirmed_not_config() {
+
+    default_address();
+    default_config();
+
+
+    var (gas_before,
+         stake_at)     = announce_test_elections(300);
+    int gas_elect      = conduct_valid_elections(400);
+    int config_addr    = config_param(config_params::config_address).begin_parse()
+                                                                    .preload_uint(256);
+    slice correct_addr = generate_internal_address_with_custom_data(0, -1, config_addr);
+    slice non_config   = generate_different_address(-1, correct_addr);
+
+    ;; Setting gas limit a bit lower than current gas_max
+    int new_gl         = rand_gl();
+    int op             = op::response::update_vset_confirm;
+    int gas_fail       = test_vset_confirm_accept(new_gl, 500, non_config,
+                                                  stake_at, op, true);
+    ;; Gas limit should not change
+    int gas_success    = test_vset_confirm_accept(new_gl, 600, correct_addr,
+                                                  stake_at, op, false);
+    return gas_before + gas_elect + gas_fail + gas_success;
+}
+
+int __test_vset_confirmed_wrong_wc() {
+
+    default_address();
+    default_config();
+
+    var (gas_before,
+         stake_at)     = announce_test_elections(300);
+    int gas_elect      = conduct_valid_elections(400);
+    int config_addr    = config_param(config_params::config_address).begin_parse()
+                                                                    .preload_uint(256);
+
+    slice correct_addr = generate_internal_address_with_custom_data(0, -1, config_addr);
+    ;; Only difference is wc
+    slice wrong_wc     = generate_internal_address_with_custom_data(0,  0, config_addr);
+
+    int new_gl         = rand_gl();
+    int op             = op::response::update_vset_confirm;
+    int gas_fail       = test_vset_confirm_accept(new_gl, 500, wrong_wc,
+                                                  stake_at, op, true);
+    int gas_success    = test_vset_confirm_accept(new_gl, 600, correct_addr,
+                                               stake_at, op, false);
+
+    return gas_before + gas_elect + gas_fail + gas_success;
+
+
+}
+
+int __test_vset_confirmed_wrong_elections() {
+
+    default_address();
+    default_config();
+
+    var (gas_before,
+         stake_at)     = announce_test_elections(300);
+    int gas_elect      = conduct_valid_elections(400);
+    int config_addr    = config_param(config_params::config_address).begin_parse()
+                                                                    .preload_uint(256);
+    int delta          = rand(12345) + 1;
+    int bad_elect      = rand(2) ? stake_at + delta : stake_at - delta;
+    slice correct_addr = generate_internal_address_with_custom_data(0, -1, config_addr);
+
+    int op             = op::response::update_vset_confirm;
+    int new_gl         = rand_gl();
+    int gas_fail       = test_vset_confirm_accept(new_gl, 500, correct_addr,
+                                                  bad_elect, op, true);
+
+    int gas_success    = test_vset_confirm_accept(new_gl, 600, correct_addr,
+                                                  stake_at,  op, false);
+
+    return gas_before + gas_elect + gas_fail + gas_success;
+
+}
+
+{-
+
+  There is no point for
+  int __test_vset_confirmed_success
+
+  since on positive scenario no data is changing 
+  and this is checked in each of the negative test
+  case as proof of error trigger.
+
+-}

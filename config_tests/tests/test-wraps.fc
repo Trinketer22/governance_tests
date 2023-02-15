@@ -1,0 +1,359 @@
+#include "constants.fc";
+#include "helpers.fc";
+
+int test_vset_update(int expect_success?, int code, slice src, int query_id, cell vset) impure inline_ref {
+
+    builder body    = vset.generate_next_vset_msg(query_id);
+    cell msg        = generate_internal_message_custom(0, 0, 0, body, src, null(), 0);
+    int data_hash   = get_data().cell_hash();
+    (int gas, _ )   = invoke_method(recv_internal, [0, msg, body.end_cell().begin_parse()]);
+    assert_update_vset(expect_success?, code, src, query_id);
+
+    if ( expect_success? ) {
+        throw_if(code + 20, data_hash == get_data().cell_hash());
+    }
+    else {
+        ;; Check that data doesn't change.
+        throw_unless(code + 20, data_hash == get_data().cell_hash());
+    }
+
+    return gas;
+}
+
+(int, int) test_new_proposal(cell new_val, int code,
+                      int prop_idx, int critical?,
+                      int expected_op, int expire_in,
+                      int ton_amount, int chash) impure inline_ref {
+
+
+    slice src_addr     = generate_internal_address();
+    int query_id       = rand(12345) + 1;
+    int lookup_gas     = 0;
+    int data_cond      = false;
+    int should_change? = ( expected_op == op::response::proposal_accepted );
+
+    ;; If expiiery not specified, get a random valid time
+    if ( expire_in == 0 ) {
+        expire_in = get_random_store_time(critical?);
+    }
+
+    cell prop       = generate_cfg_proposal(prop_idx, new_val, chash);
+    var  prop_body  = prop.generate_proposal_msg(expire_in, critical?, query_id);
+
+    ;; Same here if not specified get valid
+    if ( ton_amount == 0 ) {
+        (lookup_gas, ton_amount) = new_val.get_prop_storage_price(expire_in, critical?);
+    }
+
+    cell msg         = generate_internal_message_custom(0, ton_amount, 0, prop_body,
+                                                        src_addr, null(), 0);
+
+    int data_hash    = get_data().cell_hash();
+    (int gas_msg, _) = invoke_method(recv_internal, [ton_amount + proposal_fee, msg,
+                                                     prop_body.end_cell().begin_parse()]);
+
+    assert_new_proposal(code, src_addr, expected_op, query_id, ton_amount);
+
+    if ( should_change? ) {
+        data_cond = ( data_hash != get_data().cell_hash() );
+    }
+    else {
+        data_cond = ( data_hash == get_data().cell_hash() );
+    }
+
+    throw_unless(code + 50, data_cond);
+
+    return (lookup_gas + gas_msg, prop.cell_hash());
+}
+
+int test_prop_vote(int code, slice src_addr, builder body, int query_id, int exp_code, int exp_fail?) impure inline_ref {
+
+    cell  msg = generate_internal_message_custom(0, 0, 0, body, src_addr, null(), 0);
+
+    var (exit_code, gas_vote, _) = invoke_method_full(recv_internal, [0, msg, body.end_cell().begin_parse()]);
+
+    if ( exp_fail? ) {
+        throw_unless(code, exit_code == exp_code);
+    }
+    else {
+        ;; Except special cases
+        if ( (exp_code != special_params::update_config_code) & (exp_code != special_params::update_elector_code) ) {
+            assert_proposal_vote(code, src_addr, exp_code, query_id);
+        }
+    }
+
+    return gas_vote;
+}
+
+(int, int, int) submit_valid_vote(cell vdesc, cell keys, int code, int phash, int exp_code) inline_ref {
+    var (_, idx, desc) = vdesc.random_elem(16, false);
+    var (pub, wt, _)   = desc.parse_vdesc();
+    slice src_addr = generate_internal_address();
+
+    int priv           = keys.pick_key(pub);
+    int query_id       = rand(12345) + 1;
+
+    builder vote       = generate_vote_msg(query_id, idx, phash, priv);
+    int gas            = test_prop_vote(code, src_addr, vote, query_id, exp_code, false);
+
+    return (gas, wt, idx);
+}
+
+(cell, (int, int, int)) ~submit_valid_vote (cell vdesc, cell keys, int code, int phash, int exp_code) inline {
+    ;; Removing voted idx from vdesc
+    var (gas, wt, idx) = vdesc.submit_valid_vote(keys, code, phash, exp_code);
+    vdesc~udict_delete?(16, idx);
+
+    return (vdesc, (gas, wt, idx));
+}
+
+(cell, (int, int)) ~win_vote_round(cell vdesc, cell keys, int code, int phash, int total_weight, int critical?, int last_round?, int last_code) inline_ref {
+
+    int weight_left = muldiv(total_weight, 3, 4);
+    int exp_code    = config_vote::accepted;
+    int gas_total   = 0;
+
+    do {
+
+        var (_, idx, desc) = vdesc.random_elem(16, false);
+        var (pub, wt, _)   = desc.parse_vdesc();
+        slice src_addr     = generate_internal_address();
+        int priv           = keys.pick_key(pub);
+        int query_id       = rand(1234) + 1;
+        weight_left -= wt;
+        if ( last_round? ) {
+            if ( weight_left < 0 ) {
+                if ( last_code ) {
+                    exp_code = last_code;
+                }
+                else {
+                    exp_code = config_vote::prop_accepted - critical?;
+                }
+            }
+        }
+
+        builder vote       = generate_vote_msg(query_id, idx, phash, priv);
+        gas_total         += test_prop_vote(code, src_addr, vote, query_id, exp_code, false);
+
+        vdesc~udict_delete?(16, idx);
+
+    } until( weight_left < 0 );
+
+    return (vdesc, (gas_total, weight_left));
+}
+
+(int, int)  win_vote_round(cell vdesc, cell keys, int code, int phash, int total_weight, int critical?, int last_round?, int last_code) inline {
+    var (gas_total, weight_left) = vdesc~win_vote_round(keys, code, phash, total_weight, critical?, last_round?, last_code);
+
+    return (gas_total, weight_left);
+}
+
+int win_proposal_vote(cell vset, int code, cell keys, int phash, int critical?, int exp_code) impure inline_ref {
+    (int min_wins, _) = get_vote_wl(critical?);
+
+    var (_, _, _, _, total_weight, vdesc) = vset.parse_vset();
+    int gas = 0;
+    int ctr = 0;
+
+    repeat( min_wins ) {
+        ctr += 1;
+        int last_round?   = ( ctr == min_wins );
+        (int gas_win, _)  = vdesc.win_vote_round(keys, code, phash, total_weight, critical?, last_round?, exp_code);
+
+        if ( ~ last_round? ) {
+            next_round();
+        }
+
+        gas += gas_win;
+    }
+
+    return gas;
+}
+
+int test_external_accepted(int code, int op, int seqno, int valid_till, int priv, builder body, int expected_code) inline_ref {
+    int sign_data? = ( op == op::vote_for_config_proposal );
+    int new_gl     = rand_gl();
+
+    if ( body.null?() ) {
+        body = begin_cell();
+    }
+
+    slice msg               = generate_external_msg(op, seqno, valid_till, priv, body, sign_data?);
+    var (exit_code, gas, _) = invoke_method_full(recv_external, [msg]);
+    if ( expected_code == 0 ) {
+        throw_unless(code, new_gl < get_gl());
+    }
+    else {
+        throw_unless(code, new_gl == get_gl());
+        throw_unless(code + 1, exit_code == expected_code);
+    }
+
+    return gas;
+}
+
+int test_external_accepted_vote(cell keys, int code, int seqno, int valid_till, int phash, int expected_code) inline_ref {
+
+    int  gas   = 0;
+
+    if ( phash == false ) {
+        (int gas_prop, phash, _) = submit_valid_proposal(code, null(), null(), true);
+        gas += gas_prop;
+    }
+
+    cell vdesc = config_param(config_params::current_validators_set).load_vdesc();
+    var (_, idx, desc) = vdesc.random_elem(16, false);
+    (int pub, _, _)   = desc.parse_vdesc();
+    int priv          = keys.pick_key(pub);
+    int op            = op::vote_for_config_proposal;
+
+    builder body      = generate_vote_msg_external(idx, phash);
+
+    return gas + test_external_accepted(code + 50, op::vote_for_config_proposal, seqno, valid_till, priv, body, expected_code);
+}
+
+int test_prop_vote_ext(int code, int idx, int phash, int seqno, int exp_weight, int priv, int exp_fail, int exp_change?) impure inline_ref {
+    {-
+     There is no response is external vote.
+     So only way to check success is to verify proposal state change
+    -}
+    int op          = op::vote_for_config_proposal;
+    int gas         = 0;
+    int conf_idx    = 0;
+    int data_p      = get_data().cell_hash();
+
+    tuple st_before = null();
+
+    var vote        = generate_vote_msg_external(idx, phash);
+    slice msg       = generate_external_msg(op, seqno, now(), priv, vote, true);
+
+    ;; Saving previous state of proposal
+    var (gas_lookup, stack) = invoke_method(get_proposal, [phash]);
+    st_before = stack.first();
+    gas += gas_lookup;
+
+    int conf_idx = st_before.null?() ? 0 : st_before.at(2).at(0); ;; Config value idx
+
+    var (exit_code, gas_vote, _) = invoke_method_full(recv_external, [msg]);
+
+    gas += gas_vote;
+
+    if( exp_fail ) {
+        throw_unless(code, exit_code == exp_fail);
+    }
+    else {
+
+        throw_unless(code, exit_code == 0);
+
+        if ( ~ ( ( conf_idx ==  special_params::update_config_code ) & ( exp_weight < 0 ) ) ) {
+
+            if ( exp_change? ) {
+
+                var (gas_lookup, stack) = invoke_method(get_proposal, [phash]);
+                tuple prop = stack.first();
+                ;; If proposal is null here, and change is expected than round has ended
+                if ( prop.null?() ) {
+                    ;; Should change, so previous state should be not null
+                    throw_if(code + 2, st_before.null?());
+                    ;; Check no further
+                    return gas;
+                }
+
+                prop.assert_proposal_change(code + 10, idx, exp_weight);
+                gas += gas_lookup;
+
+
+                ;; Same deal for proposal list
+                (gas_lookup, stack) = invoke_method(list_proposals, []);
+
+                (int found?, prop)  = stack.first().find_by_id(phash);
+                prop = prop.second();
+                prop.assert_proposal_change(code + 20, idx, exp_weight);
+            }
+            else {
+                var (gas_lookup, stack) = invoke_method(get_proposal, [phash]);
+                tuple prop = stack.first();
+                ;; There is a case where this is called with null value
+                if ( st_before.null?() ) {
+                    throw_unless(code + 40, prop.null?() );
+                }
+                else {
+                    {-
+                      Data is always changed if message accepted due to seqno
+                      So we have to check proposal tuple by element
+                    -}
+
+                    prop.assert_proposal_cmp_tuple(code + 30, st_before);
+                }
+            }
+        }
+    }
+
+    return gas;
+}
+
+(int, int, int) submit_valid_vote_ext(cell vdesc, cell keys, int code, int phash, int seqno, int weight_left) impure inline_ref {
+    var (_, idx, desc) = vdesc.random_elem(16, false);
+    var (pub, wt, _)   = desc.parse_vdesc();
+    int priv           = keys.pick_key(pub);
+
+    weight_left       -= wt;
+    int gas_vote       = test_prop_vote_ext(code, idx, phash,
+                                            seqno, weight_left, priv,
+                                            false, true);
+    return (gas_vote, wt, idx);
+}
+
+(cell, (int, int, int)) ~submit_valid_vote_ext(cell vdesc, cell keys, int code, int phash, int seqno, int weight_left) impure inline {
+
+    var (gas, wt, idx) = vdesc.submit_valid_vote_ext(keys, code, phash, seqno, weight_left);
+
+    weight_left       -= wt;
+    vdesc~udict_delete?(16, idx);
+
+    return (vdesc, (gas, wt, idx));
+}
+
+(cell, (int, int, int)) ~win_vote_round_ext(cell vdesc, cell keys, int code, int phash, int seqno, int weight_left) impure inline_ref {
+
+    int gas_total   = 0;
+
+    do {
+
+        var (gas_vote, wt, idx) = vdesc~submit_valid_vote_ext(keys, code, phash, seqno, weight_left);
+
+        weight_left -= wt;
+        seqno     += 1;
+        gas_total += gas_vote;
+
+    } until( weight_left < 0 );
+
+    return (vdesc, (gas_total, weight_left, seqno));
+}
+
+
+(int, int, int) win_vote_round_ext(cell vdesc, cell keys, int code, int phash, int seqno, int weight_left) impure inline {
+    return  vdesc~win_vote_round_ext(keys,code, phash, seqno, weight_left);
+}
+
+(int, int) win_proposal_vote_ext(cell vset, int code, cell keys, int phash, int critical?, int seqno) impure inline_ref {
+
+    (int min_wins, _) = get_vote_wl(critical?);
+
+    var (_, _, _, _, total_weight, vdesc) = vset.parse_vset();
+    int weight_left = muldiv(total_weight, 3, 4);
+    int gas = 0;
+    int ctr = 0;
+
+    repeat( min_wins ) {
+        (int gas_win, _, seqno) = vdesc.win_vote_round_ext(keys, code, phash, seqno, weight_left);
+        ctr += 1;
+
+        int last_round? = ( ctr == min_wins );
+        if ( ~ last_round? ) {
+            next_round();
+        }
+        gas += gas_win;
+    }
+
+    return (gas, seqno);
+}

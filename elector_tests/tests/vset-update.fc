@@ -1,0 +1,354 @@
+#include "helpers.fc";
+
+_ test_vset_installed(int code, int elect_id, int expect_fail?) impure inline {
+    var (gas_announce, active_id) = assert_elections_announced(code + 10);
+    throw_unless(code + 1, elect_id == active_id);
+
+    int c4hash             = expect_fail? ? get_data().cell_hash() : 0;
+    int gas_tt             = tick_tock(false);
+    var (gas_check, stack) = invoke_method(active_election_id, []);
+    if ( expect_fail? ) {
+        throw_unless(code + 2, stack.first() == elect_id);
+        throw_unless(code + 3, c4hash == get_data().cell_hash());
+    }
+    else {
+        throw_unless(code + 4, stack.first() == 0);
+    }
+
+    return gas_announce + gas_tt + gas_check;
+}
+
+int __test_vset_installed_not_finished() {
+    default_address();
+    default_config();
+    var (gas_before,
+         stake_at)  = announce_test_elections(300);
+    var (gas_lookup,
+         stack)     = invoke_method(participant_list_extended, []);
+    int finished?   = stack.at(6);
+
+    ;; No way just announced elections are finished. smth is wrong
+    throw_if(304, finished?);
+    ;; Should fail
+    int gas_fail  = test_vset_installed(400, stake_at, true);
+    int gas_elect = conduct_valid_elections(500);
+
+    ;; Geting message with vset back to c5
+    set_c5(get_prev_c5());
+    cell vset = assert_elections_successfull_msg(600, stake_at);
+
+    ;; Setting vset to the config
+    set_config_param(config_params::current_validators_set, vset);
+
+    int gas_success = test_vset_installed(700, stake_at, false);
+    return gas_before + gas_lookup + gas_fail + gas_elect + gas_success;
+}
+
+int __test_vset_installed_no_cur_vset() {
+    ;; Case where current vset is not set
+    default_address();
+    default_config();
+
+    var (gas_before,
+         stake_at)  = announce_test_elections(300);
+    int gas_elect   = conduct_valid_elections(400);
+
+    set_c5(get_prev_c5());
+    cell vset = assert_elections_successfull_msg(500, stake_at);
+
+    ;; We got vset, but not going to set it yet.
+    int gas_fail = test_vset_installed(600, stake_at, true);
+
+    set_config_param(config_params::current_validators_set, vset);
+    ;; Now it's set and should succeed
+    int gas_success = test_vset_installed(700, stake_at, false);
+
+    return gas_before + gas_elect + gas_fail + gas_success;
+}
+
+int __test_vset_installed_next_vset() {
+    {-
+      Vset could be installed in either current ConfigParam 34
+      OR next validator set ConfigParam 36.
+      Goal is to check that next validator set works the same way.
+      Same as before just different ConfigParam index.
+    -}
+
+    default_address();
+    default_config();
+
+    var (gas_before,
+         stake_at)  = announce_test_elections(300);
+    int gas_elect   = conduct_valid_elections(400);
+
+    set_c5(get_prev_c5());
+    cell vset = assert_elections_successfull_msg(500, stake_at);
+
+    int gas_fail = test_vset_installed(600, stake_at, true);
+
+    ;; Setting vset into the next_validators_set intead of cur
+    set_config_param(config_params::next_validators_set, vset);
+
+    int gas_success = test_vset_installed(700, stake_at, false);
+
+    return gas_before + gas_elect + gas_fail + gas_success;
+}
+
+int __test_vset_installed_bonus_distribution() {
+    {-
+      After the vset installed the update_active_vset_id is triggered.
+      Due to elections become inactive after vset install,
+      only bonus distribution part of it executes.
+      Up to 10 msgs for up to 100 TON each with or without body.
+      Before elections adds the total amount to the nobody's
+      balance. 1/8'th of this goes to bonuses.
+      Same after finished elections, goes straight to bonuses.
+    -}
+
+    default_address();
+    default_config();
+
+    ;; Toping up nobody's balance
+    var (gas_nb, exp_nb) = add_bonuses(rand(10) + 1, rand(100) + 1, rand(2), false);
+
+    var (gas_before,
+         stake_at)  = announce_test_elections(300);
+    int gas_elect   = conduct_valid_elections(400);
+    set_c5(get_prev_c5());
+    cell vset = assert_elections_successfull_msg(500, stake_at);
+    set_config_param(config_params::current_validators_set, vset);
+    int gas_install = test_vset_installed(600, stake_at, false);
+    {-
+      At this point elections are deactivated
+      and nobody's balance bonuses should be present in past_elections
+    -}
+    var (gas_lookup, stack)       = invoke_method(past_elections, []);
+    (int found?, tuple elections) = stack.at(0).find_by_id(stake_at);
+    throw_unless(700, found?);
+    ;; 1/8'th of nobody's balance should be dedicated to bonuses for active set
+    int bonuses_prev = elections.at(6);
+    throw_unless(701, exp_nb >> 3 == bonuses_prev);
+    ;; Now let's add some more pretending to be validator fees
+    var (gas_after, exp_bonus)    = add_bonuses(rand(10) + 1, rand(100) + 1, rand(2), true);
+    var (gas_pe, stack)           = invoke_method(past_elections, []);
+    (found?, elections)           = stack.at(0).find_by_id(stake_at);
+    throw_unless(702, found?);
+    ;; Validator fees expected to be added directly to active set bonuses.
+    throw_unless(703, bonuses_prev + exp_bonus == elections.at(6));
+
+    gas_lookup                   += gas_pe;
+    return gas_nb + gas_before + gas_elect + gas_install + gas_lookup + gas_after;
+}
+
+int __test_vset_update_prolong_current_vset() {
+    {-
+      This is the case where vset is active but is not yet current in config.
+      So it's in next_validators_set.
+      When it promotes to the current set in config then active set unfreeze time
+      should start ticking.
+    -}
+
+    default_address();
+    default_config();
+
+    var (gas_before,
+         stake_at)  = announce_test_elections(300);
+    int gas_elect   = conduct_valid_elections(400);
+
+    set_c5(get_prev_c5());
+    cell vset = assert_elections_successfull_msg(500, stake_at);
+    ;; New valid(non-expired) vset
+    cell next_vset = new_vset(0, 0, null());
+
+    set_config_param(config_params::current_validators_set, vset);
+
+    ;; Not necessery, but just for ilustrative purposes we put it not ConfigParam 36
+    set_config_param(config_params::next_validators_set, next_vset);
+
+    int gas_install = test_vset_installed(600, stake_at, false);
+    ;; Now it's installed and active, but not current yet.
+
+    var (gas_lookup, stack) = invoke_method(past_elections_list, []);
+    var (found?, elections) = stack.at(0).find_by_id(stake_at);
+
+    throw_unless(700, found?);
+    int unfreeze_at = elections.at(1);
+    int stake_held  = elections.at(3);
+    int tt_count    = rand(10) + 1;
+
+    ;; And next validators set is promoted to current.
+    unset_config_param(config_params::next_validators_set);
+    set_config_param(config_params::current_validators_set, next_vset);
+    ;; Pretend some time passed
+    wait_some();
+    int gas_tt             = tick_tock(false);
+    var (gas_after, stack) = invoke_method(past_elections_list, []);
+    (found?, elections)    = stack.at(0).find_by_id(stake_at);
+    throw_unless(701, found?);
+    {-
+      Beleive it or not, this check:
+      throw_unless(802, unfreeze_at > elections.at(1));
+      Could actually be false, because inital unfreeze_at
+      I've spent literally several hours trying to figure out
+      what is going on.
+      Is time somehow messed up? w000t?!
+      SO the thing is that initial unfreeze_at is determined
+      like elect_at + elect_for + stake_held.
+      And if now() is < (elect_at + elect_for) unfreeze_at is
+      actually decreased by setting it to now() + stake_held.
+      Beleive it or not it was very hard to catch.
+      I don't know how feasable it is to get such scenarion IRL,
+      but maybt it's worth to take a closer look at:
+      https://github.com/ton-blockchain/ton/blob/master/crypto/smartcont/elector-code.fc#L887
+      Do we ever want to decrease unfreezeing time except when elections aborted?
+    -}
+
+    ;; This should alway be true no matter when elections ended and how much time passed.
+    throw_unless(702, now() + stake_held == elections.at(1));
+
+    return gas_before + gas_elect + gas_install + gas_tt + gas_lookup + gas_after;
+}
+
+{-
+      Stake unfreze tests are in this file and not elector-tests because
+      counditions of unfreezing funds are:
+      1) Time is >= unfreeze_at
+      2) Unfreezing vset id is not an active one. (Another set already elected)
+
+      And this part of the elector tests is about changing vset states.
+-}
+
+int __test_stakes_unfreeze() {
+    default_address();
+    default_config();
+
+    var (gas_before,
+         stake_at)  = announce_test_elections(300);
+    int gas_elect   = conduct_valid_elections(400);
+    ;; Picking up vset as usual and setting to current
+    set_c5(get_prev_c5());
+    cell vset = assert_elections_successfull_msg(500, stake_at);
+
+    ;; Let's stack some bonuses
+    var (gas_nb, exp_nb)          = add_bonuses(rand(100) + 1, rand(100) + 1, rand(2), false);
+
+    ;;  Installing new set
+    set_config_param(config_params::current_validators_set, vset);
+    int gas_install               = test_vset_installed(600, stake_at, false);
+
+    ;; Some more bonuses directly to it
+    var (gas_vldr, exp_direct)    = add_bonuses(rand(100) + 1, rand(100) + 1, rand(2), true);
+    int gas_bonus                 = gas_nb + gas_vldr;
+    var (gas_lookup, stack)       = invoke_method(past_elections, []);
+    var (int found?, elections)   = stack.at(0).find_by_id(stake_at);
+    throw_unless(700, found?);
+
+    int  unfreeze_at  = elections.at(1);
+    int  stake_held   = elections.at(2);
+    cell frozen       = elections.at(4);
+    int  total_stakes = elections.at(5);
+    int  bonuses      = elections.at(6);
+
+    ;; Won't hurt to check that bonuses were toped up to expected value once again
+    throw_unless(701, (exp_nb >> 3) + exp_direct == bonuses);
+
+    ;; Now let's unpack frozen dict into list of [id, credit_before, exp_unfreeze] tuples
+    tuple unfreeze = null();
+    int idx        = (1 << 255) + ((1 << 255) - 1);
+    int gas_tt     = 0;
+    int gas_after  = 0;
+    do {
+        (idx, slice sc, int f) = frozen.udict_get_prev?(256, idx);
+        if ( f ) {
+            (int addr, _, int stake) = ( sc~load_uint(256), sc~skip_bits(64), sc~load_grams());
+            int bonus                = muldiv(bonuses, stake, total_stakes);
+            var (gas_credit, credit) = compute_return_helper(addr);
+            unfreeze                 = cons( triple(addr,
+                                                    credit,
+                                                    stake + credit + bonus
+                                                    ), unfreeze);
+            gas_lookup              += gas_credit;
+        }
+        ;; Pretend that blocks keep on coming
+        wait_some();
+        gas_tt += tick_tock(false);
+    } until ( ~ f );
+    ;; Now we wait until unfreeze at
+
+    if (unfreeze_at > now()) {
+        wait_till(unfreeze_at);
+        gas_tt += tick_tock(false);
+    }
+
+    ;; Expect no changes in credits
+    gas_lookup += unfreeze.assert_credit_tuple(710, false);
+
+    ;; There is a chance that elections have been anounced
+    var (gas_elnew, stack) = invoke_method(active_election_id, []);
+    int stake_new          = stack.first();
+    gas_after             += gas_elnew;
+
+    if (stake_new == 0) {
+        ;; In case there is none
+        wait_till(vset.time_till_next_elections());
+        (int gas_announce,
+         stake_new)     = announce_test_elections(800);
+         gas_after     += gas_announce;
+    }
+
+    ;; Conducting new elections
+    gas_elect += conduct_valid_elections(900);
+
+    set_c5(get_prev_c5());
+    cell new_vset   = assert_elections_successfull_msg(1000, stake_new);
+
+    set_config_param(config_params::current_validators_set, new_vset);
+    int gas_install = test_vset_installed(1100, stake_new, false);
+
+    ;; New vset is installed and active id is changed at this point
+    gas_tt         += tick_tock(false);
+
+    {-
+      After this tho unfreeze_at is changed again.
+      Situation is (now() < unfreeze_at) & (active_id != stake_at)
+      So we check again that sesame wouldn't open.
+    -}
+
+    gas_lookup += unfreeze.assert_credit_tuple(720, false);
+
+    ;; Now let's find what's the current value of unfreeze_at
+
+    var (gas_unfreeze, stack)     = invoke_method(past_elections_list, []);
+    gas_lookup                   += gas_unfreeze;
+
+    ;; Keep in mind we're looking up old elections stake_at and not stake_new
+    var (int found?, elections)   = stack.at(0).find_by_id(stake_at);
+    throw_unless(704, found?);
+
+    int unfreeze_new = elections.at(1);
+    ;; Now new unfreeze 100% gotta be > than prevous one unlike prev test case.
+    throw_unless(705, unfreeze_new > unfreeze_at);
+    throw_unless(706, unfreeze_new == now() + stake_held);
+    ;; Wait till unfreeze and finally tick_tock
+    wait_till(unfreeze_new);
+    gas_tt += tick_tock(false);
+
+    {-
+      Depending on default setting there is a chance of new elections being announced.
+      With current config it's actually guaranteed, but config might change
+    -}
+
+    (gas_elnew, stack)     = invoke_method(active_election_id, []);
+    int stake_after        = stack.first();
+    gas_after             += gas_elnew;
+
+    if (stake_after > stake_new) {
+        ;; Elections annouced -> we need another tt to reach unfreeze_check
+        gas_tt += tick_tock(false);
+    }
+
+    ;; Now sesame should finally open
+    gas_lookup += unfreeze.assert_credit_tuple(730, true);
+
+    return gas_before + gas_elect + gas_bonus + gas_lookup + gas_tt + gas_after;
+}

@@ -1,0 +1,194 @@
+#include "helpers.fc";
+{-
+  Testing stake recovery.
+-}
+
+int __test_recover_stake_not_mc() {
+    default_address();
+    default_config();
+    var (gas_before, stake_at) = announce_test_elections(300);
+    {-
+     In theory it is possible
+     that we get exactly min_validators
+     and all participants use exact same
+     stakes and factors no one would need refund.
+     Or is it?
+     Anyways. Just to be sure let's make 1 stake
+     above max_stake to guarantee refund posibility.
+    -}
+    int stake           = invalid_stake(true);
+    (int priv, int pub) = generate_keypair();
+    (int gas_submit, _) = submit_custom_stake(false, 400, null(),
+                                              12345, stake_at,
+                                              stake, valid_factor(),
+                                              priv, pub, 0);
+
+    ;; Finished election a prequisite for stake return
+    int gas_elect = conduct_valid_elections(500);
+    int rec_val   = 0;
+    int addr      = 0;
+    ;; Now we get the participant list
+    var (gas_lookup, stack) = invoke_method(participant_list_extended, []);
+    tuple plist = stack.at(4);
+    ;; And find participant who has some creditated funds after elections.
+    do {
+       addr                   = plist~list_next().at(1).at(2);
+       (int gas_ret, rec_val) = compute_return_helper(addr);
+       gas_lookup += gas_ret;
+    } until((rec_val > 0) | plist.null?());
+
+    {-
+      Should never happen.
+      If that happened means that prior testing
+      is flawed and we still got no participants
+      succeptable to refund.
+    -}
+
+    throw_unless(600, rec_val > 0);
+
+    {-
+      Now we have participant address part.
+      Let's use it to send from basechain.
+    -}
+    int   query_id    = rand(12345) + 1;
+    slice src_addr    = generate_internal_address_with_custom_data(0, 0, addr);
+    builder msg_body  = generate_recover_stake_msg(query_id);
+    slice   bd_slice  = msg_body.end_cell().begin_parse();
+    cell    msg       = generate_internal_message_custom(0, 0, 0,
+                                                         msg_body, src_addr,
+                                                         null(), 0);
+
+    (int gas_fail, _) = invoke_method(recv_internal, [0, msg, bd_slice]);
+
+    ;; Should get recovery not allowed resp
+    assert_recovery_not_allowed(700, src_addr, query_id);
+
+    ;; Now trying with src_addr on masterchain
+    src_addr             = generate_internal_address_with_custom_data(0, -1, addr);
+    msg                  = generate_internal_message_custom(0, 0, 0,
+                                                msg_body, src_addr,
+                                                null(), 0);
+
+    (int gas_success, _) = invoke_method(recv_internal, [0, msg, bd_slice]);
+
+    ;; Making sure we get recovery successfull msg with right ton amount attached
+    assert_recovery_successfull(800, src_addr, query_id, rec_val);
+    return gas_before + gas_submit + gas_lookup + gas_elect + gas_fail + gas_success;
+}
+
+int __test_recover_stake_no_credit() {
+  default_address();
+  default_config();
+  var (gas_before, stake_at) = announce_test_elections(300);
+
+  {-
+   Now here is the oposite situation.
+   We need to guarantee that at least one
+   participant stake will be taken in full.
+   Of course we could have use some address that
+   does not belong to participant but that would not
+   be fair, right?
+   So we're going to populate elections with equal validators
+  -}
+  (_, int max_stake,
+   int min_total, _)  = get_validators_stakes();
+  (int max_validators,
+  _, _)               = get_validators_numbers();
+  int min_stake       = min_total ^/ max_validators;
+  ;; Totally can't be above max otherwise we would get
+  int fixed_stake     = max(max_stake,valid_stake_from(min_stake,0));
+  int fixed_factor    = 1 << 16; ;;Factor of 1 for simplicity
+  int gas_elect       = 0;
+  int pcount          = 0;
+  int rec_exp         = 0;
+  int finished?       = false;
+  int found?          = false;
+  cell pdict          = new_dict();
+  tuple plist         = empty_tuple();
+  slice with_refund   = null();
+  slice no_refund     = null();
+
+  do {
+      (int priv, int pub) = pdict~generate_keypair_not_in();
+      (int gas_submit, _) = submit_custom_stake(false, 400, null(),
+                                                0, stake_at,
+                                                fixed_stake, fixed_factor,
+                                                priv, pub, 0);
+
+      wait_some();
+
+      {-
+        To make sure we have at least 1 participant with credits
+        tick_tock only starts after > max_validators populated.
+        So at least one won't be on the list and have 100% refund.
+      -}
+
+      if( pcount > max_validators) {
+
+          int gas_tt        = tick_tock(false);
+          var (gas_lookup,
+               stack)       = invoke_method(participant_list_extended, []);
+          gas_elect        += gas_tt + gas_lookup;
+          plist             = stack.at(4);
+          finished?         = stack.at(6);
+      }
+
+      gas_elect        += gas_submit;
+      pcount           += 1;
+
+  } until(finished?);
+
+  ;; Now we iterate participant list in search of addr with and without refund.
+
+  do {
+       int addr               = plist~list_next().at(1).at(2);
+
+       var (gas_ret, rec_val) = compute_return_helper(addr);
+       gas_elect += gas_ret;
+
+       if( rec_val == 0 ) {
+           if( no_refund.null?() ) {
+               no_refund = generate_internal_address_with_custom_data(0, -1, addr);
+           }
+       }
+       else {
+           if( with_refund.null?() ) {
+              rec_exp     = rec_val;
+              with_refund = generate_internal_address_with_custom_data(0, -1, addr);
+           }
+       }
+
+       found? = ( ( ~ no_refund.null?() ) & ( ~ with_refund.null?() ) );
+
+  } until( found? | plist.null?());
+
+  ;; Same here both have to be found.
+  throw_unless(500, found?);
+
+  ;; Now testing stake recovery with one that has nothing to refund
+  int   query_id    = rand(12345) + 1;
+  builder msg_body  = generate_recover_stake_msg(query_id);
+  slice   bd_slice  = msg_body.end_cell().begin_parse();
+  cell    msg       = generate_internal_message_custom(0, 0, 0,
+                                                       msg_body, no_refund,
+                                                       null(), 0);
+
+  (int gas_fail, _) = invoke_method(recv_internal, [0, msg, bd_slice]);
+
+  ;; Should get recovery not allowed resp
+  assert_recovery_not_allowed(600, no_refund, query_id);
+
+  ;; And with the one that has.
+  cell    msg       = generate_internal_message_custom(0, 0, 0,
+                                                       msg_body, with_refund,
+                                                       null(), 0);
+
+
+  (int gas_success, _) = invoke_method(recv_internal, [0, msg, bd_slice]);
+
+  ;; Making sure we get recovery successfull msg with right ton amount attached
+  assert_recovery_successfull(700, with_refund, query_id, rec_exp);
+
+  return gas_before + gas_elect + gas_fail + gas_success;
+}
+

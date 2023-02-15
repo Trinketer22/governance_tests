@@ -1,0 +1,101 @@
+int get_tuple_length(tuple t) asm "TLEN";
+() set_c7(tuple t) impure asm "c7 POP";
+tuple get_real_c7() impure asm "c7 PUSH";
+
+cell get_config_cell() asm "CONFIGROOT";
+() set_my_config(cell global_config) impure asm
+    "c7 PUSH DUP FIRST" ;; (global config, c7, config)
+    "ROT"               ;; (c7, config, global config)
+    "9 SETINDEX"        ;; (c7, new_config)
+    "0 SETINDEX"        ;; (new_c7)
+    "c7 POP"
+;
+
+() set_my_address( slice addr ) impure asm
+    "c7 PUSH DUP FIRST"
+    "ROT"
+    "8 SETINDEX"
+    "0 SETINDEX"
+    "c7 POP"
+;
+
+{-
+forall X -> (tuple,()) update_tuple_at(tuple t,int idx, X value ) impure inline {
+
+    tuple new_tuple = empty_tuple();
+    int tuple_len   = t.get_tuple_length();
+    int i           = 0;
+
+    if( idx < tuple_len ) {
+        while( i < tuple_len ) {
+            if( i == idx ) {
+                new_tuple~tpush(value);
+            }
+            else {
+                new_tuple~tpush(t.at(i));
+            }
+
+            i += 1;
+        }
+        return (new_tuple,());
+    }
+
+    return (t,());
+}
+-}
+
+{-
+_ update_config(cell config_cell) impure inline {
+
+    tuple c7_tuple     = get_real_c7();
+    tuple config_tuple = c7_tuple.first();
+
+    ;; Copying all the tuple entries except config
+    config_tuple~dump();
+    config_tuple~update_tuple_at(9, config_cell);
+    config_tuple~dump();
+    c7_tuple~dump();
+    c7_tuple~update_tuple_at(0,config_tuple);
+    c7_tuple~dump();
+
+    set_c7(c7_tuple);
+}
+-}
+
+int set_config_multi(tuple params) impure inline_ref {
+
+    ;;params format is a lisp list with pair tuples [int idx, cell value]
+
+    cell  config_cell  = get_config_cell();
+    int   ctr          = 0;
+
+    while( ~ params.null?() ) {
+
+        (int idx, cell val) = params~list_next().unpair();
+        config_cell~udict_set_ref(32, idx, val);
+        ctr += 1;
+
+    }
+
+    set_my_config(config_cell);
+    ;;set_global_config(config_cell);
+
+    return ctr;
+}
+
+_ set_config_param(int idx, cell value) impure inline {
+
+    cell  config_cell = get_config_cell();
+    config_cell~udict_set_ref(32, idx, value);
+    set_my_config(config_cell);
+
+}
+
+int unset_config_param(int idx) impure inline {
+    cell config_cell = get_config_cell();
+    int status = config_cell~udict_delete?(32, idx);
+    if ( status ) {
+        set_my_config(config_cell);
+    }
+    return status;
+}

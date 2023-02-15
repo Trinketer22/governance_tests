@@ -1,0 +1,691 @@
+#include "helpers.fc";
+#include "complaint-helpers.fc";
+
+int test_new_complaint(int code, int query_id, slice src,
+                       int msg_value, builder msg_body, slice ms,
+                       int exp_result, int exp_reserve) impure inline_ref {
+
+    if ( ms.null?() ) {
+        ms = msg_body.end_cell().begin_parse();
+    }
+
+    int dhash         = exp_result > 0 ? get_data().cell_hash() : 0;
+    cell msg          = generate_internal_message_custom(0, msg_value, 0,
+                                                         msg_body, src,
+                                                         null(), 0);
+    var (gas_sent,_)  = invoke_method(recv_internal, [msg_value, msg, ms]);
+
+    assert_complaint_msg(code, src, query_id, exp_result, exp_reserve);
+
+    if( exp_result > 0 ) {
+        ;; Data should not change on errornous result.
+        throw_unless(code + 50, get_data().cell_hash() == dhash);
+    }
+    return gas_sent;
+}
+
+int __test_new_complaint_not_mc() {
+
+    default_address();
+    default_config();
+    (int gas_before,
+     int stake_at )   = announce_test_elections(300);
+    int gas_elect     = conduct_valid_elections(400);
+
+    var (gas_past,
+         stack)       = invoke_method(past_elections, []);
+
+    var(_, elections) = stack.at(0).find_by_id(stake_at);
+    ;; Picking random validator from frozen dict
+    int expire_in     = elections.at(1) - now();
+    var (pkey, fz)    = elections.at(4).random_elem(256);
+    (_, int stake)    = fz.skip_bits(256 + 64).load_grams();
+    ;; Fine from half stake to full
+    int fine          = rand(stake >> 1) + (stake >> 1);
+    int addr_part     = random();
+    int query_id      = rand(12345) + 1;
+    int fail_reason   = 1;
+    slice src_not_mc  = generate_internal_address_with_custom_data(0,  0, addr_part);
+    cell  descr       = generate_comp_description();
+    builder msg_body  = generate_complaint_message(query_id, stake_at, pkey, descr,
+                                                   now(), 1, addr_part,
+                                                   0, fine, 0);
+    slice msg_slice   = msg_body.end_cell().begin_parse();
+
+
+    ;; Skip to the begining of validator complaint
+    var (gas_storage,
+         ton_amount)  = comp_storage_price(msg_slice.skip_bits(32 + 32 + 64), expire_in);
+
+    ;; Testing not mc
+    int gas_fail      = test_new_complaint(500, query_id, src_not_mc,
+                                           ton_amount, msg_body, msg_slice,
+                                           fail_reason, 0);
+
+
+    ;; Now mc
+    slice src_mc      = generate_internal_address_with_custom_data(0, -1, addr_part);
+    int exp_reserve   = ton_amount - (1 << 30);
+    int gas_success   = test_new_complaint(600, query_id, src_mc,
+                                           ton_amount, msg_body, msg_slice,
+                                           0, exp_reserve);
+
+    return gas_before + gas_past + gas_storage + gas_elect + gas_fail + gas_success;
+}
+
+int __test_new_complaint_wrong_elections() {
+    default_address();
+    default_config();
+    (int gas_before,
+     int stake_at )   = announce_test_elections(300);
+    int gas_elect     = conduct_valid_elections(400);
+
+    var (gas_past,
+         stack)       = invoke_method(past_elections, []);
+
+    var(_, elections) = stack.at(0).find_by_id(stake_at);
+    int expire_in     = elections.at(1) - now();
+    var (pkey, fz)    = elections.at(4).random_elem(256);
+    (_, int stake)    = fz.skip_bits(256 + 64).load_grams();
+    int fine          = rand(stake >> 1) + (stake >> 1);
+    int addr_part     = random();
+    slice src         = generate_internal_address_with_custom_data(0, -1, addr_part);
+    int query_id      = rand(12345) + 1;
+    int bad_id        = 0;
+
+    do {
+        bad_id = rand(1 << 32);
+    } until(bad_id != stake_at);
+
+    cell  descr       = generate_comp_description();
+    builder msg_body  = generate_complaint_message(query_id, bad_id, pkey, descr,
+                                                   now(), 1, addr_part,
+                                                   0, fine, 0);
+
+    slice   msg_slice = msg_body.end_cell().begin_parse();
+
+    var (gas_storage,
+         ton_amount)  = comp_storage_price(msg_slice.skip_bits(32 + 32 + 64), expire_in);
+
+
+    int exp_res       = ton_amount - (1 << 30);
+    ;; Expecting fail with reason 2
+    int gas_fail      = test_new_complaint(500, query_id, src,
+                                           ton_amount, msg_body, msg_slice,
+                                           2, 0);
+
+    msg_body          = generate_complaint_message(query_id, stake_at, pkey, descr,
+                                                   now(), 1, addr_part,
+                                                   0, fine, 0);
+
+
+
+    int gas_success   = test_new_complaint(600, query_id, src,
+                                           ton_amount, msg_body, null(),
+                                           0, exp_res);
+
+
+    return gas_before + gas_elect + gas_storage + gas_fail + gas_success;
+}
+
+int __test_new_complaint_cell_too_deep() {
+
+    default_address();
+    default_config();
+    (int gas_before,
+     int stake_at )   = announce_test_elections(300);
+    int gas_elect     = conduct_valid_elections(400);
+    int fail_reason   = 3;
+
+    var (gas_past,
+         stack)       = invoke_method(past_elections, []);
+
+    var(_, elections) = stack.at(0).find_by_id(stake_at);
+    int expire_in     = elections.at(1) - now();
+    var (pkey, fz)    = elections.at(4).random_elem(256);
+    (_, int stake)    = fz.skip_bits(256 + 64).load_grams();
+    int fine          = rand(stake >> 1) + (stake >> 1);
+    int addr_part     = random();
+    slice src         = generate_internal_address_with_custom_data(0, -1, addr_part);
+    int query_id      = rand(12345) + 1;
+
+    cell  descr       = generate_comp_description();
+    int   rnd_depth   = rand(10) + 128;
+    ;; Making cell depth >= 128
+
+    repeat(rnd_depth) {
+        cell new_cell = begin_cell().store_ref(descr).end_cell();
+        descr         = new_cell;
+    }
+
+    builder msg_body  = generate_complaint_message(query_id, stake_at, pkey, descr,
+                                                   now(), 1, addr_part,
+                                                   0, fine, 0);
+
+    slice   msg_slice = msg_body.end_cell().begin_parse();
+
+    var (gas_storage,
+         ton_amount)  = comp_storage_price(msg_slice.skip_bits(32 + 32 + 64), expire_in);
+
+
+    int gas_fail      = test_new_complaint(500, query_id, src,
+                                           ton_amount, msg_body, msg_slice,
+                                           fail_reason, 0);
+
+    ;; Now let's bring depth back to normal
+    descr             = generate_comp_description();
+    msg_body          = generate_complaint_message(query_id, stake_at, pkey, descr,
+                                                   now(), 1, addr_part,
+                                                   0, fine, 0);
+    msg_slice         = msg_body.end_cell().begin_parse();
+    ;; Fix ton amount according to depth.
+    var (new_storage,
+         ton_amount)  = comp_storage_price(msg_slice.skip_bits(32 + 32 + 64), expire_in);
+
+    int exp_res       = ton_amount - (1 << 30);
+    int gas_success   = test_new_complaint(600, query_id, src,
+                                           ton_amount, msg_body, null(),
+                                           0, exp_res);
+
+
+    return gas_before + gas_elect + gas_storage + new_storage + gas_fail + gas_success;
+}
+
+int __test_new_complaint_already_expired() {
+
+    default_address();
+    default_config();
+    (int gas_before,
+     int stake_at )   = announce_test_elections(300);
+    int gas_elect     = conduct_valid_elections(400);
+    int fail_reason   = 4;
+
+    var (gas_past,
+         stack)       = invoke_method(past_elections, []);
+
+    var(_, elections) = stack.at(0).find_by_id(stake_at);
+    int unfreeze_at   = elections.at(1);
+    int ct            = now();
+    int expire_in     = unfreeze_at - ct;
+    var (pkey, fz)    = elections.at(4).random_elem(256);
+    (_, int stake)    = fz.skip_bits(256 + 64).load_grams();
+    int fine          = rand(stake >> 1) + (stake >> 1);
+    int addr_part     = random();
+    slice src         = generate_internal_address_with_custom_data(0, -1, addr_part);
+    int query_id      = rand(12345) + 1;
+
+    cell  descr       = generate_comp_description();
+
+    {-
+      Escense of this case is that complaint is made on already expired
+      elections (now() > unfreeze_at)
+    -}
+
+
+    wait_till(unfreeze_at + rand(12345));
+
+    builder msg_body  = generate_complaint_message(query_id, stake_at, pkey, descr,
+                                                   now(), 1, addr_part,
+                                                   0, fine, 0);
+
+    slice   msg_slice = msg_body.end_cell().begin_parse();
+
+    var (gas_storage,
+         ton_amount)  = comp_storage_price(msg_slice.skip_bits(32 + 32 + 64), expire_in);
+
+
+    int exp_res       = ton_amount - (1 << 30);
+    int gas_fail      = test_new_complaint(500, query_id, src,
+                                           ton_amount, msg_body, msg_slice,
+                                           fail_reason, 0);
+
+    ;; I'll be back in time
+    set_now(ct);
+    int gas_success   = test_new_complaint(600, query_id, src,
+                                           ton_amount, msg_body, msg_slice,
+                                           0, exp_res);
+
+
+    return gas_before + gas_elect + gas_storage + gas_fail + gas_success;
+}
+
+int __test_new_complaint_no_money() {
+
+    default_address();
+    default_config();
+    (int gas_before,
+     int stake_at )   = announce_test_elections(300);
+    int gas_elect     = conduct_valid_elections(400);
+    int fail_reason   = 5;
+
+    var (gas_past,
+         stack)       = invoke_method(past_elections, []);
+
+    var(_, elections) = stack.at(0).find_by_id(stake_at);
+    int expire_in     = elections.at(1) - now();
+    var (pkey, fz)    = elections.at(4).random_elem(256);
+    (_, int stake)    = fz.skip_bits(256 + 64).load_grams();
+    int fine          = rand(stake >> 1) + (stake >> 1);
+    int addr_part     = random();
+    slice src         = generate_internal_address_with_custom_data(0, -1, addr_part);
+    int query_id      = rand(12345) + 1;
+
+    cell  descr       = generate_comp_description();
+
+    builder msg_body  = generate_complaint_message(query_id, stake_at, pkey, descr,
+                                                   now(), 1, addr_part,
+                                                   0, fine, 0);
+
+    slice   msg_slice = msg_body.end_cell().begin_parse();
+
+    var (gas_storage,
+         ton_amount)  = comp_storage_price(msg_slice.skip_bits(32 + 32 + 64), expire_in);
+
+
+    int lower_amount  = rand(ton_amount);
+    int exp_res       = ton_amount - (1 << 30);
+    int gas_fail      = test_new_complaint(500, query_id, src,
+                                           lower_amount, msg_body, msg_slice,
+                                           fail_reason, 0);
+
+    ;; Now with correct TON amount
+    int gas_success   = test_new_complaint(600, query_id, src,
+                                           ton_amount, msg_body, msg_slice,
+                                           0, exp_res);
+
+
+    return gas_before + gas_elect + gas_storage + gas_fail + gas_success;
+}
+
+int __test_new_complaint_wrong_validator() {
+
+    default_address();
+    default_config();
+    (int gas_before,
+     int stake_at )   = announce_test_elections(300);
+    int gas_elect     = conduct_valid_elections(400);
+    int fail_reason   = 6;
+
+    var (gas_past,
+         stack)       = invoke_method(past_elections, []);
+
+    var(_, elections) = stack.at(0).find_by_id(stake_at);
+    int expire_in     = elections.at(1) - now();
+    cell frozen       = elections.at(4);
+    var (pkey, fz)    = frozen.random_elem(256);
+    (_, int stake)    = fz.skip_bits(256 + 64).load_grams();
+    int fine          = rand(stake >> 1) + (stake >> 1);
+    int addr_part     = random();
+    int query_id      = rand(12345) + 1;
+    slice src         = generate_internal_address_with_custom_data(0, -1, addr_part);
+    cell  descr       = generate_comp_description();
+
+    int wrong_vldtr   = 0;
+    int found?        = true;
+
+    ;; Picking validator public key, thad doesn't  exist in frozen stakes dict
+
+    do {
+       wrong_vldtr    = random();
+       var(_, found?) = frozen.udict_get?(256, wrong_vldtr);
+    } until( ~ found? );
+
+    builder msg_body  = generate_complaint_message(query_id, stake_at, wrong_vldtr, descr,
+                                                   now(), 1, addr_part,
+                                                   0, fine, 0);
+
+    slice   msg_slice = msg_body.end_cell().begin_parse();
+
+    var (gas_storage,
+         ton_amount)  = comp_storage_price(msg_slice.skip_bits(32 + 32 + 64), expire_in);
+
+
+    int exp_res       = ton_amount - (1 << 30);
+    int gas_fail      = test_new_complaint(500, query_id, src,
+                                           ton_amount, msg_body, msg_slice,
+                                           fail_reason, 0);
+
+    ;; Now with correct public key
+    msg_body          = generate_complaint_message(query_id, stake_at, pkey, descr,
+                                                   now(), 1, addr_part,
+                                                   0, fine, 0);
+
+    int gas_success   = test_new_complaint(600, query_id, src,
+                                           ton_amount, msg_body, null(),
+                                           0, exp_res);
+
+
+    return gas_before + gas_elect + gas_storage + gas_fail + gas_success;
+}
+
+int __test_new_complaint_fine_too_large() {
+
+    default_address();
+    default_config();
+    (int gas_before,
+     int stake_at )   = announce_test_elections(300);
+    int gas_elect     = conduct_valid_elections(400);
+    int fail_reason   = 7;
+
+    var (gas_past,
+         stack)       = invoke_method(past_elections, []);
+
+    var(_, elections) = stack.at(0).find_by_id(stake_at);
+    int expire_in     = elections.at(1) - now();
+    cell frozen       = elections.at(4);
+    var (pkey, fz)    = frozen.random_elem(256);
+    (_, int stake)    = fz.skip_bits(256 + 64).load_grams();
+    int addr_part     = random();
+    int query_id      = rand(12345) + 1;
+    slice src         = generate_internal_address_with_custom_data(0, -1, addr_part);
+    cell  descr       = generate_comp_description();
+
+    ;; Trying fine larger than stake
+    int fine          = rand(12345) + stake;
+    ;; This defines additional stake of fine to be added (stake * fine_part) / 2**32
+    int fine_part    = 0;
+
+    builder msg_body  = generate_complaint_message(query_id, stake_at, pkey, descr,
+                                                   now(), 1, addr_part,
+                                                   0, fine, fine_part);
+    slice   msg_slice = msg_body.end_cell().begin_parse();
+
+    var (gas_storage,
+         ton_amount)  = comp_storage_price(msg_slice.skip_bits(32 + 32 + 64), expire_in);
+
+    int gas_fail      = test_new_complaint(500, query_id, src,
+                                           ton_amount, msg_body, msg_slice,
+                                           fail_reason, 0);
+
+    ;; Now let's try fine half the stake, but use large fine part
+    ;; 1 << 31 fine part is equal to stake >> 1 but we add some
+
+    (fine, fine_part) = ((stake >> 1) + 2, 1 << 31);
+    msg_body          = generate_complaint_message(query_id, stake_at, pkey, descr,
+                                                   now(), 1, addr_part,
+                                                   0, fine, fine_part);
+
+    int gas_part      = test_new_complaint(600, query_id, src,
+                                           ton_amount, msg_body, null(),
+                                           fail_reason, 0);
+    gas_fail         += gas_part;
+    ;; 1/4 the stake via fine part (1 << 32) / (1 << 30) == 4
+
+    (fine, fine_part) = (0, 1 << 30);
+    msg_body          = generate_complaint_message(query_id, stake_at, pkey, descr,
+                                                   now(), 1, addr_part,
+                                                   0, fine, fine_part);
+    msg_slice         = msg_body.end_cell().begin_parse();
+
+    var (gas_storage,
+         ton_amount)  = comp_storage_price(msg_slice.skip_bits(32 + 32 + 64), expire_in);
+
+    int exp_res       = ton_amount - (1 << 30);
+    int gas_success   = test_new_complaint(700, query_id, src,
+                                           ton_amount, msg_body, msg_slice,
+                                           0, exp_res);
+
+    return gas_before + gas_elect + gas_storage + gas_fail + gas_part + gas_success;
+}
+
+int __test_new_complaint_paid_more_than_fine() {
+    {-
+      Case where amount paid for complaint storage
+      is lower or equal to validators fine
+    -}
+
+    default_address();
+    default_config();
+    (int gas_before,
+     int stake_at )   = announce_test_elections(300);
+    int gas_elect     = conduct_valid_elections(400);
+    int fail_reason   = 8;
+
+    var (gas_past,
+         stack)       = invoke_method(past_elections, []);
+
+    var(_, elections) = stack.at(0).find_by_id(stake_at);
+    int expire_in     = elections.at(1) - now();
+    cell frozen       = elections.at(4);
+    var (pkey, fz)    = frozen.random_elem(256);
+    (_, int stake)    = fz.skip_bits(256 + 64).load_grams();
+    int addr_part     = random();
+    int query_id      = rand(12345) + 1;
+    int fine          = stake >> 1;
+    slice src         = generate_internal_address_with_custom_data(0, -1, addr_part);
+    cell  descr       = generate_comp_description();
+
+    builder msg_good  = generate_complaint_message(query_id, stake_at, pkey, descr,
+                                                   now(), 1, addr_part,
+                                                   0, fine, 0);
+    slice msg_slice   = msg_good.end_cell().begin_parse();
+
+    var (gas_storage,
+         ton_amount)  = comp_storage_price(msg_slice.skip_bits(32 + 32 + 64), expire_in);
+
+    int  paid         = ton_amount - (1 << 30);
+    int  low_fine     = rand(paid >> 1)  + (paid >> 2);
+
+    builder msg_low   = generate_complaint_message(query_id, stake_at, pkey, descr,
+                                                   now(), 1, addr_part,
+                                                   0, low_fine, 0);
+
+    int gas_fail      = test_new_complaint(500, query_id, src,
+                                           ton_amount, msg_low, null(),
+                                           fail_reason, 0);
+
+
+    int gas_success   = test_new_complaint(600, query_id, src,
+                                           ton_amount, msg_good, msg_slice,
+                                           0, paid);
+
+    return gas_before + gas_elect + gas_storage + gas_fail + gas_success;
+}
+
+int __test_new_complaint_duplicate() {
+
+    default_address();
+    default_config();
+    (int gas_before,
+     int stake_at )   = announce_test_elections(300);
+    int gas_elect     = conduct_valid_elections(400);
+    int fail_reason   = 9;
+
+    var (gas_past,
+         stack)       = invoke_method(past_elections, []);
+
+    var(_, elections) = stack.at(0).find_by_id(stake_at);
+    int unfreeze_at   = elections.at(1);
+    int expire_in     = unfreeze_at - now();
+    cell frozen       = elections.at(4);
+    var (pkey, fz)    = frozen.random_elem(256);
+    (_, int stake)    = fz.skip_bits(256 + 64).load_grams();
+    int addr_part     = random();
+    int query_id      = rand(12345) + 1;
+    int fine          = 0;
+    int fine_part     = 1 << 30;
+    int created_at    = now();
+    int severity      = 1;
+    int paid          = 0;
+    slice src         = generate_internal_address_with_custom_data(0, -1, addr_part);
+    cell  descr       = generate_comp_description();
+    builder msg_body  = generate_complaint_message(query_id, stake_at, pkey, descr,
+                                                   created_at, severity, addr_part,
+                                                   paid, fine, fine_part);
+    slice msg_slice   = msg_body.end_cell().begin_parse();
+    var (gas_storage,
+         ton_amount)  = comp_storage_price(msg_slice.skip_bits(32 + 32 + 64), expire_in);
+
+
+    int exp_res       = ton_amount - (1 << 30);
+    ;; This has to succeed
+    int gas_first     = test_new_complaint(500, query_id, src,
+                                           ton_amount, msg_body, msg_slice,
+                                           0, exp_res);
+
+    ;; This is a duplicate, so should fail
+    int gas_fail      = test_new_complaint(600, query_id, src,
+                                           ton_amount, msg_body, msg_slice,
+                                           fail_reason, exp_res);
+
+    int gas_success   = 0;
+    int idx           = 0;
+
+    {-
+      Checking that changing any of the complait related fields results in
+      successfull complaint submission.
+    -}
+    repeat(8) {
+        int addr_new = addr_part;
+        int new_fine = 0;
+        int new_key  = pkey;
+
+        if( idx == 0 ) {
+            ;; Pick new pkey
+            do {
+                (new_key, _) = frozen.random_elem(256);
+            } until( new_key != pkey );
+        }
+        if( idx == 1) {
+            ;; Pick new descr
+            int dsc_hash  = descr.cell_hash();
+            do {
+                descr     = generate_comp_description();
+            } until ( descr.cell_hash() != dsc_hash );
+        }
+        if ( idx == 2 ) {
+            ;; New created at
+            wait_some();
+            ;; Otherwise expected reserve won't match
+            expire_in = unfreeze_at - now();
+        }
+        if ( idx == 3 ) {
+            ;; New severity
+            severity += 1;
+        }
+        if (idx == 4 ) {
+            do {
+                addr_new = random();
+            } until ( addr_new != addr_part );
+            src  = generate_internal_address_with_custom_data(0, -1, addr_new);
+        }
+        if ( idx == 5 ) {
+            {-
+               Initial message paid field has no impact on the actual logic.
+               Trick is that now paid is > 0 and thus occupies more bits,
+               so real storage price grows.
+            -}
+            paid += rand(100) + 1;
+        }
+        if ( idx == 6 ) {
+            ;; New fine
+            new_fine += 1000;
+        }
+        if ( idx == 7 ) {
+            ;; New fine part
+            fine_part  = fine_part << 1;
+        }
+
+        builder msg_new = generate_complaint_message(query_id, stake_at, new_key, descr,
+                                                   created_at, severity, addr_new,
+                                                   paid, new_fine, fine_part);
+        slice sc        = msg_new.end_cell().begin_parse();
+        var (gas_storage_new,
+             ton_amount)  = comp_storage_price(sc.skip_bits(32 + 32 + 64), expire_in);
+
+        int exp_res  = ton_amount - (1 << 30);
+        int gas_sc   = test_new_complaint(700 + idx, query_id, src,
+                                           ton_amount, msg_new, sc,
+                                           0, exp_res);
+
+        idx += 1;
+
+        gas_storage += gas_storage_new;
+        gas_success += gas_sc;
+    }
+
+    return gas_before + gas_elect + gas_storage + gas_first + gas_fail + gas_success;
+}
+
+int __test_new_complaint_success() {
+
+    default_address();
+    default_config();
+    (int gas_before,
+     int stake_at )   = announce_test_elections(300);
+    int gas_elect     = conduct_valid_elections(400);
+    int fail_reason   = 9;
+
+    var (gas_past,
+         stack)       = invoke_method(past_elections, []);
+
+    var(_, elections) = stack.at(0).find_by_id(stake_at);
+    int gas_storage   = 0;
+    int gas_lookup    = 0;
+    int gas_submit    = 0;
+    int unfreeze_at   = elections.at(1);
+    int expire_in     = unfreeze_at - now();
+    int found?        = false;
+    int pkey          = 0;
+    cell frozen       = elections.at(4);
+    ;; Unroll loop a bit;
+    (pkey,
+    slice fz,
+    found?)           = frozen.udict_get_next?(256, pkey);
+    ;; Something went wrong, frozend dict can't be empty
+    throw_unless(301, found?);
+    ;; For each validator submit some complaint and verify against every get method
+    do {
+
+        (_, int stake)    = fz.skip_bits(256 + 64).load_grams();
+        int addr_part     = random();
+        int query_id      = rand(12345) + 1;
+        int fine          = rand(stake >> 1);
+        int fine_part     = 1 << (rand(21) + 10);
+        int created_at    = now();
+        int severity      = rand(256);
+        int paid          = 0;
+        slice src         = generate_internal_address_with_custom_data(0, -1, addr_part);
+        cell  descr       = generate_comp_description();
+        builder msg_body  = generate_complaint_message(query_id, stake_at, pkey, descr,
+                                                       created_at, severity, addr_part,
+                                                       paid, fine, fine_part);
+        slice msg_slice   = msg_body.end_cell().begin_parse();
+        slice comp_slice  = msg_slice.skip_bits(32 + 32 + 64);
+        (int gas_st,
+         int ton_amount)  = comp_storage_price(comp_slice, expire_in);
+        int paid          = ton_amount - (1 << 30);
+        gas_storage      += gas_st;
+
+        ;; Real view of complaint wihh paid field
+        builder msg_real  = generate_complaint_message(query_id, stake_at, pkey, descr,
+                                                       created_at, severity, addr_part,
+                                                       paid, fine, fine_part
+                                                       );
+
+        int comp_hash     = msg_real.end_cell().begin_parse()
+                                               .skip_bits(32 + 32 + 64).slice_hash();
+        ;; This has to succeed
+        gas_submit       += test_new_complaint(500, query_id, src,
+                                               ton_amount, msg_body, msg_slice,
+                                               0, paid);
+        gas_lookup       += assert_show_complaint(600, stake_at, comp_hash, pkey,
+                                                     descr, created_at, severity,
+                                                     addr_part, paid, fine, fine_part);
+
+        gas_lookup       += assert_list_complaints(700, stake_at, comp_hash, pkey,
+                                                     descr, created_at, severity,
+                                                     addr_part, paid, fine, fine_part);
+
+        gas_lookup       += assert_get_past_complaints(800, stake_at, comp_hash, pkey,
+                                                   descr, created_at, severity,
+                                                   addr_part, paid, fine, fine_part);
+
+        (pkey,
+         fz,
+         found?)          = frozen.udict_get_next?(256, pkey);
+
+    } until( ~ found? );
+
+    return gas_before + gas_elect + gas_storage + gas_lookup;
+}

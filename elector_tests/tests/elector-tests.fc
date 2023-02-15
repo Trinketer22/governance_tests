@@ -1,0 +1,1741 @@
+#include "helpers.fc";
+#include "constants.fc";
+
+{-
+  Default contract state.
+
+  <b
+    0 1 u, // Current elections Maybe Cell
+    0 1 u, // Empty credits:(Hashmap 256 Grams)
+    0 1 u, // Empty past_elections (HashmapE 32 PastElection) ;; index elect_at
+    0 Gram, // nobody balance
+    0 32 u, // active election id
+    0 256 u, // active_hash
+  b>
+  Thus on tick_tock elections should be announced
+
+-}
+
+int __test_election_announce_not_elector() {
+    ;; From default contract state ticktock should announce new elections.
+    slice elector_address = generate_internal_address_with_custom_data(0, -1, random());
+    set_my_address(elector_address);
+
+    ;;Default config among everything else sets up cur address as elector.
+    default_config();
+
+    ;; Checking that there are no active elections
+    int gas_before = assert_no_active_elections(300);
+
+    ;; Changing current address to different one
+    set_my_address(generate_different_address(-1, elector_address));
+    int gas_tt     = tick_tock(false);
+    ;; Should fail since address is not elector
+    int gas_fail   = assert_no_active_elections(301);
+    assert_no_actions();
+
+    ;;Changing it back
+    set_my_address(elector_address);
+    gas_tt        += tick_tock(false);
+
+    var (gas_success, stack) = invoke_method(active_election_id,[]);
+    ;;Should succeed and announce new elections
+    throw_unless(302, stack.first() != 0);
+
+    return gas_before + gas_fail + gas_tt + gas_success;
+}
+
+int __test_election_announce_not_masterchain() {
+    ;; Saving address part so it won't change on verification.
+    int address_part = random();
+    slice bc_address = generate_internal_address_with_custom_data(0, 0, address_part);
+    ;; Setting contract address on basechain
+    set_my_address(bc_address);
+    ;; Elector address is config is represented by adddress part only
+    default_config();
+
+    ;; Checking that there are no active elections.
+    int gas_before = assert_no_active_elections(300);
+
+    int gas_tt = tick_tock(false);
+    ;; Should fail since contract address is not on masterchain.
+    int gas_fail   = assert_no_active_elections(301);
+    assert_no_actions();
+
+    ;; Same address, different chain.
+    slice mc_address = generate_internal_address_with_custom_data(0, -1, address_part);
+    set_my_address(mc_address);
+    gas_tt    += tick_tock(false);
+    var (gas_success, stack) = invoke_method(active_election_id,[]);
+    ;; Should succeed and announce new elections.
+    throw_unless(302, stack.first() != 0);
+
+    return gas_before + gas_fail + gas_tt + gas_success;
+
+}
+
+int __test_election_announce_no_curr_validators_set() {
+    default_address();
+    default_config();
+    ;; Saving previous config param value
+    cell prev_set   = config_param(config_params::current_validators_set);
+
+    ;; No active elections
+    int gas_before  = assert_no_active_elections(300);
+
+    ;; Unsetting config key
+    unset_config_param(config_params::current_validators_set);
+
+    {-
+      We expect tick_tock to throw exception.
+      If any of tick tock triggered functions returns true.
+      exectution is terminated till next tick tock.
+      Else the other handler can be triggered.
+      In this case annouce_new_elections returns false
+      due to lack of Config Param 34.
+      Then update_active_vset_id is triggered,
+      that doesn't check for existence of Config Param 34
+      and just takes cell hash of resulting value, which
+      is not cell.
+      Throwing code 7.
+   -}
+
+    int gas_tt      = tick_tock(true);
+    ;; Should fail since no current validators set in config
+    int gas_fail    = assert_no_active_elections(301);
+    assert_no_actions();
+
+    ;; Setting config back
+    set_config_param(config_params::current_validators_set, prev_set);
+    gas_tt         += tick_tock(false);
+    var (gas_success, stack) = invoke_method(active_election_id,[]);
+    ;; Should succeed and announce new elections.
+    throw_unless(302, stack.first() != 0);
+
+    return gas_before + gas_fail + gas_tt + gas_success;
+}
+
+{-
+  There is no format check in old elector.
+  int __test_election_announce_validators_set_malformed() {
+      default_address();
+      default_config();
+      TODO
+
+  }
+-}
+
+int __test_election_announce_not_expired() {
+    ;; Testing case where current validators set is not expired.
+
+    default_address();
+    default_config();
+
+    slice vt      = config_param(config_params::validation_times).begin_parse();
+    (_, int start_before) = (vt~load_int(32), vt~load_int(32));
+    int shift     = rand(3600) + 100;
+    int time_left = shift + start_before;
+    ;; No active elections
+    int gas_before     = assert_no_active_elections(300);
+
+    ;; Setting yet valid validators set.
+    cell valid_yet_set = validators_set(now() - shift, now() + time_left, 5, 5, 0, null());
+    set_config_param(config_params::current_validators_set, valid_yet_set);
+
+    ;; Should fail
+    int gas_tt         = tick_tock(false);
+    int gas_fail       = assert_no_active_elections(301);
+    assert_no_actions();
+
+    ;; Time travel.
+    set_now(now() + time_left);
+    gas_tt            += tick_tock(false);
+
+    var (gas_success, stack) = invoke_method(active_election_id, []);
+    throw_unless(302, stack.first() != 0);
+
+    return gas_before + gas_fail + gas_tt + gas_success;
+}
+
+int __test_election_announce_next_set_already_elected() {
+
+    default_address();
+    default_config();
+
+    cell next_vset = default_validators();
+    ;; No active elections
+    int gas_before  = assert_no_active_elections(300);
+    ;; Setting next validators set in config
+    set_config_param(config_params::next_validators_set, next_vset);
+
+    int gas_tt      = tick_tock(false);
+    ;; Should fail.
+    int gas_fail    = assert_no_active_elections(301);
+    assert_no_actions();
+
+    ;; Unsetting next validators set.
+    unset_config_param(config_params::next_validators_set);
+
+    gas_tt         += tick_tock(false);
+
+    var (gas_success, stack) = invoke_method(active_election_id, []);
+    throw_unless(302, stack.first() != 0);
+
+    return gas_before + gas_fail + gas_tt + gas_success;
+}
+
+{-
+  Case where elections announced while
+  previous elections history contains
+  record with lower timestamp.
+  Implemented only in newer elector code.
+  int __test_election_announce_before_existed_elections() {
+      ;;TODO
+  }
+-}
+
+int __test_election_announce_success() {
+
+    default_address();
+    default_config();
+
+    ;; No active elections
+    int gas_before               = assert_no_active_elections(300);
+    gas_before                   = tick_tock(false);
+
+    var (gas_announce, elect_at) = assert_elections_announced(301);
+    throw_unless(302, elect_at != 0);
+
+    var (gas_plist, stack)       = invoke_method(participant_list_extended, []);
+    throw_unless(303, elect_at == stack.first());
+
+    (int elected_for,
+     int start_before,
+     int end_before,
+     int held_for)               = get_validation_times();
+    (_,
+    int min_stake)               = config_param(config_params::validators_stakes)
+                                                .begin_parse().load_grams();
+
+    throw_unless(304, elect_at == now() + start_before);
+    throw_unless(305, stack.second() == elect_at - end_before);
+    throw_unless(306, stack.third()  == min_stake);
+    throw_unless(307, stack.fourth() == 0); ;; Total stake
+    throw_unless(308, stack.at(4).null?()); ;; Participants list
+    throw_unless(309, stack.at(5)    == false); ;; failed
+    throw_unless(310, stack.at(6)    == false); ;; finished
+
+
+    return gas_before + gas_announce + gas_plist;
+}
+
+int __test_new_stake_no_elections() {
+
+    default_address();
+    default_config();
+
+    ;; Testing no elections case
+    int gas_before    = assert_no_active_elections(300);
+
+    var (priv, pub)   = generate_keypair();
+    int wc            = -1; ;; Masterchain
+    int query_id      = 0; ;; query_id 0 produces no return message on success
+    int exp_reason    = stake_reject::no_elections;
+    int adnl          = random();
+    int stake         = valid_stake(0);
+    int factor        = valid_factor();
+    int ton_amount    = stake + ONECOIN;
+    int stake_at      = now(); ;; Non-existing elections
+    slice src_addr    = generate_internal_address_with_custom_data(0, wc, random());
+    builder stake_msg = generate_new_stake_message(query_id, priv,
+                                                   pub, stake_at,
+                                                   factor, src_addr,
+                                                   adnl);
+
+    cell msg          = generate_internal_message_custom(0, ton_amount, 0,
+                                                         stake_msg, src_addr,
+                                                         null(), 0);
+
+    var (gas_fail, stack) = invoke_method(recv_internal,
+                                          [ton_amount, msg,
+                                           stake_msg.end_cell().begin_parse()
+                                          ]);
+
+    assert_stake_reject(500, src_addr, query_id, exp_reason);
+
+    ;; Getting elections to announce
+    int gas_tt        = tick_tock(false);
+
+    var (gas_announce, stack) = invoke_method(active_election_id, []);
+    stake_at = stack.first();
+    ;; Elections should be announced
+    throw_if(600, stake_at == 0);
+
+    stake_msg         = generate_new_stake_message(query_id, priv,
+                                                   pub, stake_at,
+                                                   factor, src_addr,
+                                                   adnl);
+
+    ;; Testing with announced elections
+    var (gas_success, stack)  = invoke_method(recv_internal,
+                                          [ton_amount, msg,
+                                           stake_msg.end_cell().begin_parse()
+                                          ]);
+
+
+    ;; With query_id == 0 there should be no messages on success.
+
+    assert_no_actions();
+
+    return gas_before  + gas_fail + gas_announce + gas_tt + gas_success;
+}
+
+int __test_new_stake_not_masterchain() {
+
+    default_address();
+    default_config();
+
+    ;; No elections yet
+    int gas_before    = assert_no_active_elections(300);
+
+    gas_before       += tick_tock(false);
+    var(gas_announce,
+        stake_at)     = assert_elections_announced(301);
+
+    var (priv, pub)   = generate_keypair();
+
+    int wc            = 0; ;; Basechain should trigger error
+
+    int query_id      = 0;
+    int exp_reason    = stake_reject::not_masterchain;
+    int adnl          = random();
+    int stake         = valid_stake(0);
+    int factor        = valid_factor();
+    int ton_amount    = stake + ONECOIN;
+    int addr_part     = random();
+    slice src_addr    = generate_internal_address_with_custom_data(0, wc, addr_part);
+    builder stake_msg = generate_new_stake_message(query_id, priv,
+                                                   pub, stake_at,
+                                                   factor, src_addr,
+                                                   adnl);
+
+    cell msg          = generate_internal_message_custom(0, ton_amount, 0,
+                                                         stake_msg, src_addr,
+                                                         null(), 0);
+
+    var (gas_fail,
+         stack)       = invoke_method(recv_internal,
+                                          [ton_amount, msg,
+                                           stake_msg.end_cell().begin_parse()
+                                          ]);
+
+    assert_stake_reject(500, src_addr, query_id, exp_reason);
+
+    ;; Setting masterchain
+    wc = -1;
+    src_addr          = generate_internal_address_with_custom_data(0,wc,addr_part);
+    stake_msg         = generate_new_stake_message(query_id, priv,
+                                                   pub, stake_at,
+                                                   factor, src_addr,
+                                                   adnl);
+    msg               = generate_internal_message_custom(0, ton_amount, 0,
+                                                         stake_msg, src_addr,
+                                                         null(), 0);
+    ;; Sending stake from masterchain
+    var (gas_success,
+         stack)       = invoke_method(recv_internal,
+                                          [ton_amount, msg,
+                                           stake_msg.end_cell().begin_parse()
+                                          ]);
+
+
+    assert_no_actions();
+    return gas_before + gas_announce + gas_fail + gas_success;
+}
+
+int __test_new_stake_already_finished() {
+
+    default_address();
+    default_config();
+
+    int exp_err     = stake_reject::elections_finished;
+    var (priv, pub) = generate_keypair();
+    ;; No active elections
+    int gas_before  = assert_no_active_elections(300);
+    int gas_tt      = tick_tock(false);
+    var(gas_announce,
+        stake_at)   = assert_elections_announced(301);
+    ;; Conducting elections.
+    int gas_elect   = conduct_valid_elections(500);
+
+    ;; Elections are finished right here.
+    ;; Probably doesn't make sense to check it, but maybe for illustrative purposes.
+    var (gas_lookup,
+        stack)      = invoke_method(participant_list_extended, []);
+    throw_unless(302, stack.at(6));
+
+    ;; Now new stake parameters.
+    var (gas_after,
+         src_addr)  = submit_custom_stake(true, exp_err, null(),
+                                          0, stake_at,
+                                          valid_stake(stack.at(3)), valid_factor(),
+                                          priv, pub, 0);
+
+
+
+    return gas_before + gas_tt + gas_elect + gas_lookup + gas_after;
+}
+
+int __test_new_stake_invalid_signature() {
+
+    default_address();
+    default_config();
+
+    ;; No elections yet
+    int gas_before    = assert_no_active_elections(300);
+
+    gas_before       += tick_tock(false);
+    var(gas_announce,
+        stake_at)     = assert_elections_announced(301);
+
+    var (priv, pub)   = generate_keypair();
+    int wc            = -1;
+    int query_id      = 0;
+
+    int exp_reason    = stake_reject::invalid_signature;
+
+    int adnl          = random();
+    int stake         = valid_stake(0);
+    int factor        = valid_factor();
+    int ton_amount    = stake + ONECOIN;
+    slice src_addr    = generate_internal_address_with_custom_data(0, wc, random());
+    ;; Generating message with some other private key
+    int wrong_key     = generate_different(priv);
+    builder stake_msg = generate_new_stake_message(query_id, wrong_key,
+                                                   pub, stake_at,
+                                                   factor, src_addr,
+                                                   adnl);
+    cell msg          = generate_internal_message_custom(0, ton_amount, 0,
+                                                         stake_msg, src_addr,
+                                                         null(), 0);
+    var (gas_fail,
+         stack)       = invoke_method(recv_internal,
+                                          [ton_amount, msg,
+                                           stake_msg.end_cell().begin_parse()
+                                          ]);
+
+    assert_stake_reject(500, src_addr, query_id, exp_reason);
+
+    ;; Now generating message with correct key
+    stake_msg         = generate_new_stake_message(query_id, priv,
+                                                   pub, stake_at,
+                                                   factor, src_addr,
+                                                   adnl);
+    var (gas_success,
+         stack)       = invoke_method(recv_internal,
+                                          [ton_amount, msg,
+                                           stake_msg.end_cell().begin_parse()
+                                          ]);
+
+    ;; Should succeed.
+    assert_no_actions();
+
+    return gas_before + gas_announce + gas_fail + gas_success;
+
+}
+
+int __test_new_stake_low_fraction() {
+    ;; Testing case where submited stake is lower than 1/4096 of total_stake.
+
+    default_address();
+    default_config();
+
+    ;; No elections yet
+    int gas_before    = assert_no_active_elections(300);
+
+    gas_before       += tick_tock(false);
+    var(gas_announce,
+        stake_at)     = assert_elections_announced(301);
+    var (priv, pub)   = generate_keypair();
+    int wc            = -1;
+    int query_id      = 0;
+
+    int exp_reason    = stake_reject::low_fraction; ;; Less than 1/4096 of total stake
+    int adnl          = random();
+    int factor        = valid_factor();
+    slice src_addr    = generate_internal_address_with_custom_data(0, wc, random());
+    ;; We need some valid stakes to be submited.
+    var (gas_init, total_stake) = submit_stakes(400, rand(4) + 1);
+    ;; Getting elections data
+    ;; total_stake from elector should be equal to our total_stake
+    var (gas_plist, stack)      = invoke_method(participant_list_extended, []);
+    throw_unless(302, stack.fourth() == total_stake);
+
+    int stake         = rand(total_stake >> 12); ;;total_stake / 4096
+    int ton_amount    = stake + ONECOIN;
+    builder stake_msg = generate_new_stake_message(query_id, priv,
+                                                   pub, stake_at,
+                                                   factor, src_addr,
+                                                   adnl);
+
+    cell msg          = generate_internal_message_custom(0, ton_amount, 0,
+                                                         stake_msg, src_addr,
+                                                         null(), 0);
+
+
+    var (gas_fail,
+         stack)       = invoke_method(recv_internal,
+                                          [ton_amount, msg,
+                                           stake_msg.end_cell().begin_parse()
+                                          ]);
+
+    assert_stake_reject(500, src_addr, query_id, exp_reason);
+
+    ;; Now let's change stake to a value larger than 1/4096 of total stake
+    ;; In some cases it would still be lower than min_value.
+    stake             = rand(1024) + ( total_stake >> 12 );
+    ton_amount        = stake + ONECOIN;
+    var (gas_success,
+         stack)       = invoke_method(recv_internal,
+                                          [ton_amount, msg,
+                                           stake_msg.end_cell().begin_parse()
+                                          ]);
+
+    if( stake < get_min_stake() ) {
+        ;; 5 is code for lower than min stake
+        assert_stake_reject(600, src_addr, query_id, 5);
+    }
+    else {
+        ;; Should succeed
+        assert_no_actions();
+    }
+
+    return gas_before + gas_init + gas_plist + gas_fail + gas_success;
+}
+
+int __test_new_stake_low_fraction_confirmation_fee() {
+
+    {-
+      Here we test edge case where no 1TON confirmation comission
+      is not added to msg_value.
+      Current elector decuts 1 TON REGARDLESS of query_id even though message
+      is not sent when query_id == 0.
+      Other than that it is identical to previous test case.
+    -}
+
+    default_address();
+    default_config();
+
+    ;; No elections yet
+    int gas_before    = assert_no_active_elections(300);
+
+    gas_before       += tick_tock(false);
+    var(gas_announce,
+        stake_at)     = assert_elections_announced(301);
+    var (priv, pub)   = generate_keypair();
+    int wc            = -1;
+    ;; query_id could be 0 in old elector, however lets' test with != 0 for compatibility.
+    int query_id      = rand(12345);
+
+    int exp_reason    = stake_reject::low_fraction; ;; Less than 1/4096 of total stake
+    int adnl          = random();
+    int factor        = valid_factor();
+    slice src_addr    = generate_internal_address_with_custom_data(0, wc, random());
+    ;; We need some valid stakes to be submited.
+    var (gas_init, total_stake) = submit_stakes(400, rand(4) + 1);
+    ;; Getting elections data
+    ;; total_stake from elector should be equal to our total_stake
+    var (gas_plist, stack)      = invoke_method(participant_list_extended, []);
+    throw_unless(302, stack.fourth() == total_stake);
+
+    ;; In this case we make it exactly 1/4096
+    ;; and do not add ONECOIN to ton_amount but pass stake as is.
+    int stake         = total_stake >> 12;
+    builder stake_msg = generate_new_stake_message(query_id, priv,
+                                                   pub, stake_at,
+                                                   factor, src_addr,
+                                                   adnl);
+
+    cell msg          = generate_internal_message_custom(0, stake, 0,
+                                                         stake_msg, src_addr,
+                                                         null(), 0);
+
+
+    var (gas_fail,
+         stack)       = invoke_method(recv_internal,
+                                          [stake, msg,
+                                           stake_msg.end_cell().begin_parse()
+                                          ]);
+
+    assert_stake_reject(500, src_addr, query_id, exp_reason);
+
+    {- Now we add confirmation commision to the stake value.
+     In some cases it would still be lower than min_value.
+     + 1 is required due to accuracy loss of bitwise  shift.
+     (x >> 12) << 12 not always equals x.
+    -}
+
+    stake            += ONECOIN + 1;
+    var (gas_success,
+         stack)       = invoke_method(recv_internal,
+                                          [stake, msg,
+                                           stake_msg.end_cell().begin_parse()
+                                          ]);
+
+    if ( stake < get_min_stake() ) {
+        ;; 5 is code for lower than min stake
+        assert_stake_reject(600, src_addr, query_id, 5);
+    }
+    else {
+        ;; Should succeed
+        if( query_id > 0 ) {
+            assert_stake_accepted(700, src_addr, query_id);
+        }
+        else {
+            assert_no_actions();
+        }
+    }
+
+    return gas_before + gas_init + gas_plist + gas_fail + gas_success;
+
+}
+
+int __test_new_stake_wrong_elections() {
+
+    default_address();
+    default_config();
+
+    ;; No elections yet
+    int gas_before    = assert_no_active_elections(300);
+
+    gas_before       += tick_tock(false);
+    var(gas_announce,
+        stake_at)     = assert_elections_announced(301);
+
+    var (priv, pub)   = generate_keypair();
+    int wc            = -1;
+    int query_id      = 0;
+
+    int exp_reason    = stake_reject::wrong_elections; ;; Wrong elections
+
+    int adnl          = random();
+    int stake         = valid_stake(0);
+    int factor        = valid_factor();
+    int ton_amount    = stake + ONECOIN;
+
+    ;; Some past or future elections id
+    int elections_id  = rand(2) ? stake_at + rand(12345) : stake_at - rand(12345);
+
+    slice src_addr    = generate_internal_address_with_custom_data(0, wc, random());
+    builder stake_msg = generate_new_stake_message(query_id, priv,
+                                                   pub, elections_id,
+                                                   factor, src_addr,
+                                                   adnl);
+
+    cell msg          = generate_internal_message_custom(0, ton_amount, 0,
+                                                         stake_msg, src_addr,
+                                                         null(), 0);
+    var (gas_fail,
+         stack)       = invoke_method(recv_internal,
+                                          [stake, msg,
+                                           stake_msg.end_cell().begin_parse()
+                                          ]);
+
+    ;; Should fail.
+    assert_stake_reject(500, src_addr, query_id, exp_reason);
+    ;; Now let's send stake with correct stake_at
+    stake_msg         = generate_new_stake_message(query_id, priv,
+                                                   pub, stake_at,
+                                                   factor, src_addr,
+                                                   adnl);
+
+    var (gas_success,
+         stack)       = invoke_method(recv_internal,
+                                          [stake, msg,
+                                           stake_msg.end_cell().begin_parse()
+                                          ]);
+
+    assert_no_actions();
+
+    return gas_before + gas_fail + gas_success;
+}
+
+int __test_new_stake_pkey_addr_pair() {
+
+    {-
+     Stake can be submited by one pubkey:src_addr pair.
+     If pubkey is used multiple times from different src_addr
+     contract should not allow that.
+    -}
+
+    default_address();
+    default_config();
+
+    ;; No elections yet
+    int gas_before    = assert_no_active_elections(300);
+
+    gas_before       += tick_tock(false);
+    var(gas_announce,
+        stake_at)     = assert_elections_announced(301);
+
+    var (priv, pub)   = generate_keypair();
+    int wc            = -1;
+    int query_id      = 0;
+
+    int exp_reason    = stake_reject::pubkey_addr_used;
+
+    int adnl          = random();
+    int stake         = valid_stake(0);
+    int factor        = valid_factor();
+    int ton_amount    = stake + ONECOIN;
+    int first_src     = random();
+
+    ;; This is an address part of second stake will be made with same pubkey.
+    int second_src    = generate_different(first_src);
+
+    slice src_addr    = generate_internal_address_with_custom_data(0, wc, first_src);
+    builder stake_msg = generate_new_stake_message(query_id, priv,
+                                                   pub, stake_at,
+                                                   factor, src_addr,
+                                                   adnl);
+    cell msg          = generate_internal_message_custom(0, ton_amount, 0,
+                                                         stake_msg, src_addr,
+                                                         null(), 0);
+    ;; This stake should succeed.
+    var (gas_success,
+         stack)       = invoke_method(recv_internal,
+                                          [ton_amount, msg,
+                                           stake_msg.end_cell().begin_parse()
+                                          ]);
+
+    assert_no_actions();
+
+    ;; Now we check that our stake has been accepted and is equal to submited value.
+    var (gas_check,
+         stack)       = invoke_method(participates_in, [pub]);
+    int cur_stake     = stack.first();
+    throw_unless(302, cur_stake == stake);
+
+    ;; Using same pkey from different src address.
+    ;; New stake just in case.
+    int new_stake     = valid_stake(0);
+    slice new_src     = generate_internal_address_with_custom_data(0, wc, second_src);
+    builder new_msg   = generate_new_stake_message(query_id, priv,
+                                                   pub, stake_at,
+                                                   factor, new_src, ;; Important change
+                                                   adnl);
+    cell fail_msg     = generate_internal_message_custom(0, new_stake, 0,
+                                                         new_msg, new_src,
+                                                         null(), 0);
+    var (gas_fail,
+         stack)       = invoke_method(recv_internal,
+                                          [new_stake + ONECOIN, fail_msg,
+                                           new_msg.end_cell().begin_parse()
+                                          ]);
+    ;; This should report fail back to new_src.
+    assert_stake_reject(500, new_src, query_id, exp_reason);
+    ;; Same message from old source address should succeed.
+    new_msg           = generate_new_stake_message(query_id, priv,
+                                                   pub, stake_at,
+                                                   factor, src_addr, ;; Changed back.
+                                                   adnl);
+    cell success_msg  = generate_internal_message_custom(0, new_stake, 0,
+                                                         new_msg, src_addr,
+                                                         null(), 0);
+    var (gas_final,
+         stack)       = invoke_method(recv_internal,
+                                          [new_stake + ONECOIN, success_msg,
+                                           new_msg.end_cell().begin_parse()
+                                          ]);
+    assert_no_actions();
+
+    ;; Checking that total stake of our pubkey increased by new_stake amount.
+    var (gas_check2,
+         stack)       = invoke_method(participates_in, [pub]);
+    throw_unless(303, new_stake + stake == stack.first());
+
+
+
+    return gas_before + gas_check + gas_check2 + gas_fail + gas_success + gas_final;
+}
+
+int __test_new_stake_lower_min_stake() {
+
+    default_address();
+    default_config();
+
+    ;; No elections yet
+    int gas_before    = assert_no_active_elections(300);
+
+    gas_before       += tick_tock(false);
+    var(gas_announce,
+        stake_at)     = assert_elections_announced(301);
+
+    var (priv, pub)   = generate_keypair();
+    int wc            = -1;
+    int query_id      = 0;
+    int exp_reason    = stake_reject::stake_too_low;
+    int adnl          = random();
+    int min_stake     = get_min_stake();
+
+    int stake         = rand(min_stake); ;; Stake lower than min_stake.
+
+    int factor        = valid_factor();
+    int ton_amount    = stake + ONECOIN;
+
+    slice src_addr    = generate_internal_address_with_custom_data(0, wc, random());
+    builder stake_msg = generate_new_stake_message(query_id, priv,
+                                                   pub, stake_at,
+                                                   factor, src_addr,
+                                                   adnl);
+    cell msg          = generate_internal_message_custom(0, ton_amount, 0,
+                                                         stake_msg, src_addr,
+                                                         null(), 0);
+    var (gas_fail,
+         stack)       = invoke_method(recv_internal,
+                                          [ton_amount, msg,
+                                           stake_msg.end_cell().begin_parse()
+                                          ]);
+
+    ;; Fail with state_too_low status
+    assert_stake_reject(500, src_addr, query_id, exp_reason);
+
+    ;; Now let's set stake to min_stake value including commision.
+    ton_amount        = min_stake + ONECOIN;
+
+    var (gas_success,
+         stack)       = invoke_method(recv_internal,
+                                          [ton_amount, msg,
+                                           stake_msg.end_cell().begin_parse()
+                                          ]);
+
+    assert_no_actions();
+
+    return gas_before + gas_fail + gas_success;
+}
+
+int __test_new_stake_lower_min_stake_confirmation_fee() {
+
+    {-
+      Here we test edge case where no 1TON confirmation fee
+      is not added to msg_value.
+      Current elector decuts 1 TON REGARDLESS of query_id even though message
+      is not sent when query_id == 0.
+      Other than that it is identical to previous test case.
+      Kind of like __test_new_stake_low_fraction_confirmation_fee.
+    -}
+
+
+    default_address();
+    default_config();
+
+    ;; No elections yet
+    int gas_before    = assert_no_active_elections(300);
+    gas_before       += tick_tock(false);
+    var(gas_announce,
+        stake_at)     = assert_elections_announced(301);
+    var (priv, pub)   = generate_keypair();
+    int wc            = -1;
+
+    ;; If query_id > 0 we're going to get confirmation message.
+    int query_id      = rand(12345);
+
+    int exp_reason    = stake_reject::stake_too_low;
+    int adnl          = random();
+    int stake         = get_min_stake(); ;; Stake is equal to min_stake
+
+    {-
+      Here comes gotcha!
+      Confirmation fee is decuted no matter what.
+      Thus if msg_value is < ONECOIN after decution
+      stake would be < 0 < (0 >> 12)
+      so reason 2 (low fraction) would trigger.
+      Absolute minimum msg_value for this case to trigger
+      is ONECOIN.
+    -}
+
+    int ton_amount    = max(ONECOIN, stake); ;; No comission included.
+    int factor        = valid_factor();
+
+    slice src_addr    = generate_internal_address_with_custom_data(0, wc, random());
+    builder stake_msg = generate_new_stake_message(query_id, priv,
+                                                   pub, stake_at,
+                                                   factor, src_addr,
+                                                   adnl);
+
+    ;; Sending message with just stake and no confirmation fee.
+    cell msg          = generate_internal_message_custom(0, ton_amount, 0,
+                                                         stake_msg, src_addr,
+                                                         null(), 0);
+     var (gas_fail,
+         stack)       = invoke_method(recv_internal,
+                                          [ton_amount, msg,
+                                           stake_msg.end_cell().begin_parse()
+                                          ]);
+
+    ;; Fail with state_too_low status
+    assert_stake_reject(500, src_addr, query_id, exp_reason);
+
+    ;; Now let's add fee to msg_value
+    var (gas_success,
+         stack)       = invoke_method(recv_internal,
+                                          [ton_amount + ONECOIN, msg,
+                                           stake_msg.end_cell().begin_parse()
+                                          ]);
+    if ( query_id > 0 ) {
+        assert_stake_accepted(600, src_addr, query_id);
+    }
+    else {
+        assert_no_actions();
+    }
+
+    return gas_before + gas_fail + gas_success;
+}
+
+int __test_new_stake_low_factor() {
+
+    default_address();
+    default_config();
+
+    ;; No elections yet
+    int gas_before    = assert_no_active_elections(300);
+    gas_before       += tick_tock(false);
+    var(gas_announce,
+        stake_at)     = assert_elections_announced(301);
+    var (priv, pub)   = generate_keypair();
+    int wc            = -1;
+    int query_id      = 0;
+
+    int exp_reason    = stake_reject::factor_too_low;
+
+    int adnl          = random();
+    int stake         = valid_stake(0);
+    int ton_amount    = stake + ONECOIN;
+    int factor        = rand(1 << 16); ;; Factor/65536 < 1 is not valid.
+
+    slice src_addr    = generate_internal_address_with_custom_data(0, wc, random());
+    builder stake_msg = generate_new_stake_message(query_id, priv,
+                                                   pub, stake_at,
+                                                   factor, src_addr,
+                                                   adnl);
+
+    ;; Sending message with just stake and no confirmation fee.
+    cell msg          = generate_internal_message_custom(0, ton_amount, 0,
+                                                         stake_msg, src_addr,
+                                                         null(), 0);
+    var (gas_fail,
+         stack)       = invoke_method(recv_internal,
+                                          [ton_amount, msg,
+                                           stake_msg.end_cell().begin_parse()
+                                          ]);
+
+    assert_stake_reject(500, src_addr, query_id, exp_reason);
+
+    ;; Now let's try message with valid factor.
+    factor            = valid_factor();
+    stake_msg         = generate_new_stake_message(query_id, priv,
+                                                   pub, stake_at,
+                                                   factor, src_addr,
+                                                   adnl);
+
+    var (gas_success,
+         stack)       = invoke_method(recv_internal,
+                                          [ton_amount, msg,
+                                           stake_msg.end_cell().begin_parse()
+                                          ]);
+    assert_no_actions();
+
+    return gas_before + gas_fail + gas_success;
+}
+
+int __test_new_stake_success() {
+
+    default_address();
+    default_config();
+
+    {-
+     1)Total stake should increase by stake amount
+     2)Public key and stake data should be present in *members* dict of the elections.
+     3)If stake was already accepted from this pub key previously, it should sum up.
+     4)If request `query_id > 0` confirmation message is sent back
+
+     We've more or less tested it in negative scenarios.
+      Would that be enough to test it once? Probably not.
+     Is there a chance that state would get messed up somewhere in between? Likely.
+     So we're going to supply randomized valid and invalid stakes till elections finish.
+     reaches min_total_stake and in every case test all of the conditions to stay valid.
+     Kind of like fuzzing.
+
+     We only test that new stake messages are handled correctly
+     and not the resulst of elections.
+    -}
+
+    ;; No elections yet
+    int gas_before    = assert_no_active_elections(300);
+    int gas_elections = 0;
+    int cnt           = 0;
+    int total_stake   = 0;
+    int prev_total    = 0;
+    int finished?     = false;
+    int participated? = false;
+    int gas_tt        = tick_tock(false);
+    cell participants = new_dict();
+    tuple prev_plist  = null();
+    var(gas_announce,
+        stake_at)     = assert_elections_announced(301);
+
+    do {
+
+        int new_stake       = valid_stake(total_stake);
+        int exp_stake       = new_stake;
+        int exp_fail?       = false;
+        int exp_reason      = 0;
+        int new_factor      = valid_factor();
+        int query_id        = rand(12345);
+        var (priv, pub)     = generate_keypair();
+
+        ;;Roll the dice if  stake should fail
+        int should_fail?    = cnt > 0 ? rand(2) : false;
+
+        int cur_elections   = stake_at;
+        slice src_addr      = null();
+        int increase_stake? = false;
+
+        if ( cnt > 0 ) {
+            if( should_fail? ) {
+                exp_stake   = 0; ;; if fail no stake should be added.
+                exp_reason = rand(6) + 1; ;; Picking failure reason from 1 to 6;
+                if( exp_reason == stake_reject::invalid_signature ) {
+                    ;; Failed signature. Let's break key pair.
+                    pub = random();
+                }
+                if( exp_reason == stake_reject::low_fraction ) {
+                    ;; Stake lower 1/4096 of total_stake
+                    new_stake = rand(total_stake >> 12);
+                }
+                if( exp_reason == stake_reject::wrong_elections ) {
+                    ;; Stake from different elections
+                    cur_elections = stake_at - rand(12345);
+                }
+                if( exp_reason == stake_reject::pubkey_addr_used ) {
+                    ;; Stake from already used pubkey and different src_addr
+                    (pub, slice pt)  = participants.random_elem(256);
+                    ;; Generating different source address.
+                    src_addr  = generate_different_address(-1, pt~load_msg_addr());
+                    exp_stake = pt~load_grams();
+                    ;; Loading old private key.
+                    priv      = pt~load_uint(256);
+                }
+                if( exp_reason == stake_reject::stake_too_low ) {
+                    ;; Stake lower min_stake
+                    int min_stake = get_min_stake();
+                    int low_fract = total_stake >> 12;
+                    {-
+                      We can only get to this case when
+                      low_fract < stake < min_stake
+                      otherwise we would trigger low_fraction.
+                    -}
+                    if( low_fract < min_stake ) {
+                        new_stake = min(rand(min_stake) + low_fract, min_stake - 1);
+                    }
+                    else {
+                        new_stake  = min(rand(low_fract) + min_stake, low_fract - 1);
+                        exp_reason = stake_reject::low_fraction;
+                    }
+                }
+                if( exp_reason == stake_reject::factor_too_low ) {
+                    new_factor  = rand(1 << 16);
+                }
+            }
+            else {
+                ;; Maybe existing participant should increase stake
+                increase_stake? = rand(2);
+                if ( increase_stake? ) {
+                    (pub, slice pt) = participants.random_elem(256);
+                    src_addr        = pt~load_msg_addr();
+                    exp_stake       = pt~load_grams() + new_stake;
+                    priv            = pt~load_uint(256);
+                }
+            }
+            if ( (exp_reason != stake_reject::pubkey_addr_used)
+                 & ( increase_stake? == 0 ) ) {
+                {-
+                 That's probably too much, but idk PRNG quality.
+                 Maybe we can get same pubkey from PRNG withing test scenario.
+                 Definitely don't want to trigger error in testing scenario
+                 when it's not expected.
+                -}
+
+                var (participated?,
+                     prev_src,
+                     prev_stake,
+                     prev_priv) = participants.lookup_participant?(pub);
+
+                if ( participated? ) {
+                    src_addr   = prev_src;
+                    exp_stake += prev_stake;
+                    priv       = prev_priv;
+                }
+            }
+        }
+
+        var (gas_new,
+        src_addr)         = submit_custom_stake(should_fail?, exp_reason,src_addr,
+                                                query_id, cur_elections,
+                                                new_stake, new_factor,
+                                                priv, pub, random());
+
+        ;; Keep on ticking and tocking.
+        gas_tt           += tick_tock(false);
+
+        {-
+          Previously elections_start_before were equal toelections_end_before
+          So elections ended immediately.
+          Which is not realistic.
+          We have to emulate some time between stakes.
+        -}
+        wait_some();
+
+        gas_elections    += gas_new;
+        var (gas_plist,
+        stack)            = invoke_method(participant_list_extended, []);
+        gas_elections    += gas_plist;
+
+        total_stake       = stack.at(3);
+        finished?         = stack.at(6);
+        tuple plist       = stack.at(4);
+
+        ifnot ( should_fail? ){
+            ;; Checking stakes as expected.
+            throw_unless(700, total_stake == prev_total + new_stake);
+            var (gas_lookup, stack) = invoke_method(participates_in, [pub]);
+            throw_unless(701, exp_stake == stack.first());
+
+            ;; Now let's check if data matches in participants list.
+            var(pfound?, pdata) = plist.find_participant(pub);
+            throw_unless(702, pfound?);
+            throw_unless(703, exp_stake  == pdata.first());
+            throw_unless(703, new_factor == pdata.second());
+            var (wc, addr_part) = src_addr.parse_std_addr();
+            throw_unless(704, addr_part  == pdata.third());
+
+            ;; Keep our own participants dict up to date.
+            builder p_data    = begin_cell().store_slice(src_addr)
+                                            .store_grams(exp_stake)
+                                            .store_uint(priv, 256);
+            participants~udict_set_builder(256, pub, p_data);
+            cnt              += 1;
+            gas_elections    += gas_lookup;
+        }
+        else {
+            ;; Checking that nothing has changed.
+            throw_unless(800, total_stake == prev_total);
+            var (gas_lookup, stack) = invoke_method(participates_in, [pub]);
+            throw_unless(801, exp_stake   == stack.first());
+            gas_elections    += gas_lookup;
+
+            ;; And in participants list too.
+            ifnot( prev_plist.null?() ) {
+                ;; And in the participants list too.
+                throw_unless(802, equal_plists?(plist, prev_plist));
+            }
+        }
+
+        prev_total = total_stake;
+        prev_plist = plist;
+
+    } until( finished? );
+
+    return gas_before + gas_announce + gas_elections;
+}
+
+int __test_elections_ongoing() {
+
+    default_address();
+    default_config();
+
+    {-
+      Testing that elections won't change it's state (finished/failed)
+      till it's not time to finish elections.
+    -}
+
+    int gas_before    = assert_no_active_elections(300);
+    int gas_tt        = tick_tock(false);
+    var (gas_announce,
+    stake_at)         = assert_elections_announced(301);
+    int stake_f       = rand(3) + 2;
+    cell pdict        = new_dict();
+
+    {-
+      Two to four times total minimal stake
+      and minimum required number of validators
+      should pretty much guarantee successfull elections.
+    -}
+
+    int min_total     = get_min_total_stake() * stake_f;
+    int min_vldtrs    = get_min_validators();
+
+    ;; Stake >= min_total and do not tick time.
+    var (gas_elect,
+         stake_total) = pdict~stake_till(400, min_total, min_vldtrs, 0, false);
+
+    ;; At this point threre is way more than enough staked
+
+    gas_tt           += tick_tock(false);
+    var (gas_lookup1,
+         stack)       = invoke_method(participant_list_extended, []);
+
+    ;; Throw if elections have finished.
+    throw_if(302, stack.at(6));
+    ;; Now let's travel in time and check if that's the issue.
+    int elect_close   = stack.at(1);
+    wait_till(elect_close);
+    gas_tt           += tick_tock(false);
+
+    var (gas_lookup2,
+         stack)       = invoke_method(participant_list_extended, []);
+
+    ;; Throw unless elections were successfull
+    throw_unless(303, stack.at(6));
+
+    return gas_before + gas_tt + gas_elect + gas_lookup1 + gas_lookup2;
+}
+
+int __test_elections_no_config() {
+
+    default_address();
+    default_config();
+
+    {-
+      Testing that elections won't change it's state (finished/failed)
+      till there is no config contract address
+      in ConfigParam 0
+
+      Testing logic pretty much same as in previous scenario.
+    -}
+
+    cell prev_config  = config_param(config_params::config_address);
+    unset_config_param(config_params::config_address);
+
+    int gas_before    = assert_no_active_elections(300);
+    int gas_tt        = tick_tock(false);
+    var (gas_announce,
+    stake_at)         = assert_elections_announced(301);
+    int stake_f       = rand(3) + 2;
+    cell pdict        = new_dict();
+
+    {-
+      Two to four times total minimal stake
+      and minimum required number of validators
+      should pretty much guarantee successfull elections.
+    -}
+
+    int min_total     = get_min_total_stake() * stake_f;
+    int min_vldtrs    = get_min_validators();
+
+    ;; Taking time into account this time.
+    var (gas_elect,
+         stake_total) = pdict~stake_till(400, min_total, min_vldtrs, 0, true);
+
+    var (gas_time,
+         stack)       = invoke_method(participant_list_extended, []);
+
+    ;; Still not guaranteed that time reached closing time
+    int elect_close   = stack.at(1);
+    wait_till(elect_close);
+
+    ;; Now it is guaranteed.
+    ;; At this point threre is way more than enough staked
+    gas_tt           += tick_tock(false);
+    var (gas_lookup1,
+         stack)       = invoke_method(participant_list_extended, []);
+
+    ;; Throw if elections have finished.
+    throw_if(302, stack.at(6));
+
+    ;; Now set config address back.
+    set_config_param(config_params::config_address, prev_config);
+    gas_tt           += tick_tock(false);
+
+    var (gas_lookup2,
+         stack)       = invoke_method(participant_list_extended, []);
+
+    ;; Throw unless elections were successfull
+    throw_unless(303, stack.at(6));
+
+    return gas_before + gas_tt + gas_elect + gas_time + gas_lookup1 + gas_lookup2;
+}
+
+int __test_election_less_min_participants() {
+
+    default_address();
+    default_config();
+
+    {-
+      Testing case where less than minimum validators took part
+      in elections.
+      Previous cases were not changing elections state
+      where this one would set it to fail state
+      till new stakes submitted.
+    -}
+
+    int gas_before    = assert_no_active_elections(300);
+    int gas_tt        = tick_tock(false);
+    var (gas_announce,
+    stake_at)         = assert_elections_announced(301);
+    int stake_f       = rand(3) + 2;
+    cell pdict        = new_dict();
+
+
+    ;; Total stake is still more than enough
+    int min_total     = get_min_total_stake() * stake_f;
+    int config_min    = get_min_validators();
+
+    ;; If minimum is set to 1 we can't test < 1  validators case.
+    throw_unless(302, config_min > 1);
+    ;; validators count however is from 1 to min_validators - 1
+    int min_vldtrs    = rand(config_min - 1) + 1;
+
+    var (gas_elect,
+         stake_total) = pdict~stake_till(400, min_total, min_vldtrs, 0, true);
+    var (gas_time,
+         stack)       = invoke_method(participant_list_extended, []);
+
+    ;; Still not guaranteed that time reached closing time
+    int elect_close   = stack.at(1);
+    wait_till(elect_close);
+
+    ;; Now it is guaranteed.
+    ;; At this point threre is way more than enough staked
+    gas_tt           += tick_tock(false);
+    var (gas_lookup1,
+         stack)       = invoke_method(participant_list_extended, []);
+
+    ;; Check that elections are in fail state.
+    throw_unless(302, stack.at(5));
+
+    ;; validators minimal - participants list len
+    int more_participants = config_min - stack.at(4).list_len();
+    {-
+      Now here is the catch:
+      stakes should be on par with already made ones, otherwise
+      there is a chance that true_stake would be lower than minimal.
+      That's a whole separate test case.
+    -}
+
+    int avg_stake = stake_total ^/ min_vldtrs;
+
+    repeat( more_participants ) {
+        int stake  = valid_stake_from(avg_stake, stake_total);
+        (int priv,
+         int pub)  = pdict~generate_keypair_not_in();
+
+        (int gas_submit,
+        _)         = submit_custom_stake(false, 0, null(),
+                                        0, stake_at,
+                                        stake, valid_factor(),
+                                        priv, pub, random());
+        wait_some();
+        gas_elect += gas_submit;
+        gas_tt    += tick_tock(false);
+    }
+
+    var (gas_lookup2,
+         stack)       = invoke_method(participant_list_extended, []);
+
+    ;; Throw unless elections were successfull
+    throw_unless(303, stack.at(6));
+
+    return gas_before + gas_tt + gas_elect + gas_time + gas_lookup1 + gas_lookup2;
+}
+
+int __test_election_less_min_total_stake() {
+
+    default_address();
+    default_config();
+
+    {-
+      Testing case where total stake is lower
+      than required minimum.
+      There is a catch tho:
+      If min_stake * min_validators > min_total_stake
+      we can't really test that case, because there is more than
+      one reason for elections to fail from logic standpoint.
+
+      On the other hand total_stake >= min_total_stake
+      is checked prior to the other checks so we can ignore it.
+      Not sure what is sthe best approach here.
+    -}
+
+    int min_validators = get_min_validators();
+
+    (int min_stake,
+     int max_stake_opt,
+     int min_total,
+     _ )               = get_validators_stakes();
+
+    int total_stake    = 0;
+    int gas_fail       = 0;
+    int gas_success    = 0;
+    int gas_before     = assert_no_active_elections(300);
+    int gas_tt         = tick_tock(false);
+    var (gas_announce,
+    stake_at)          = assert_elections_announced(301);
+    cell pdict         = new_dict();
+
+    throw_unless(302, min_stake * min_validators < min_total);
+
+    int max_stake      = min_total / min_validators;
+
+    var (gas_time,
+         stack)       = invoke_method(participant_list_extended, []);
+    int elect_close   = stack.at(1);
+    gas_before       += gas_time;
+
+
+    repeat( min_validators ) {
+        int stake      = min(valid_stake_from(min_stake, total_stake), max_stake);
+
+        (int priv,
+         int pub)      = pdict~generate_keypair_not_in();
+
+        (int gas_submit,
+        _)             = submit_custom_stake(false, 0 , null(),
+                                         0, stake_at,
+                                         stake, valid_factor(),
+                                         priv, pub, random());
+        gas_fail      += gas_submit;
+        wait_some();
+        total_stake   += stake;
+        gas_tt        += tick_tock(false);
+    }
+
+    if( now() < elect_close ) {
+        set_now(elect_close);
+        gas_tt += tick_tock(false);
+    }
+
+    var (gas_lookup,
+         stack)         = invoke_method(participant_list_extended, []);
+
+    ;; Check that elections are not finished or failed.
+    throw_if(303, stack.at(6) | stack.at(5));
+
+    {-
+      Doesn't matter if stake_left > max_stake
+      since that part is only calculated after the
+      total_stake >= min_total_stake check that is
+      tested here.
+    -}
+
+    int stake_left = min_total - total_stake;
+    var (priv,pub) = pdict~generate_keypair_not_in();
+    (int gas_submit, _) = submit_custom_stake(false, 0, null(),
+                                              0, stake_at,
+                                              stake_left, valid_factor(),
+                                              priv, pub, random());
+
+    wait_some();
+    gas_tt += tick_tock(false);
+
+    var (gas_lookup,
+         stack)       = invoke_method(participant_list_extended, []);
+    {-
+      Now because total stake amount check is made
+      prior to attempting to conduct elections,
+      they won't necesserely succeed.
+      Most likely true_stake might be < min_total.
+      But true_stake is the subject of other test.
+      The fact that either status of elections has
+      changed from default (false, false) means
+      that total_stake >= min_total_stake check is passed.
+    -}
+
+    throw_unless(304, (stack.at(6) | stack.at(5)));
+
+    gas_success      += gas_submit + gas_lookup;
+
+    return gas_before + gas_tt + gas_fail + gas_success;
+}
+
+int __test_true_stake_less_min_total_stake() {
+
+    {-
+      When true_stake < total_stake?
+      1) When stake > max_stake was made
+      2) effective stake of a j-th (j<i) applicant is calculated as
+         min(stake[i]*max_factor[j], stake[j])
+         so if stake[i]*max_factor[j] < stake[j]
+         that's what is taken as stake instead of stake[j]
+
+         In this scenario we have several fat cats
+         validators with large stakes covering all of the required
+         min_total_stake and some validators with minor stakes
+         that should decrease true_stake amount due to second
+         condition.
+   -}
+
+    default_address();
+    default_config();
+
+    int gas_before     = assert_no_active_elections(300);
+    int gas_tt         = tick_tock(false);
+    int total_stake    = 0;
+
+    var (gas_announce,
+    stake_at)          = assert_elections_announced(301);
+    gas_before        += gas_announce;
+
+    int min_validators = get_min_validators();
+    int fat_cats       = rand(min_validators - 2) + 1;
+
+    (int min_stake,
+     int max_stake,
+     int min_total,
+     _ )               = get_validators_stakes();
+
+
+    cell pdict         = new_dict();
+    cell sdict         = new_dict();
+    int fat_stake      = max(min_stake, min_total ^/ fat_cats);
+
+    var (gas_time,
+         stack)       = invoke_method(participant_list_extended, []);
+
+    int elect_close   = stack.at(1);
+    gas_before       += gas_time;
+
+    repeat(fat_cats) {
+        int stake    = valid_stake_from(fat_stake, total_stake);
+        int factor   = valid_factor();
+        int adnl     = random();
+
+        (int priv,
+         int pub)    = pdict~generate_keypair_not_in();
+
+        (int gas_submit,
+        slice src)   = submit_custom_stake(false, 0, null(),
+                                           0, stake_at,
+                                           stake,valid_factor(),
+                                           priv, pub, adnl);
+
+        sdict~store_sorted_stake(stake, factor, now(), pub, src, adnl);
+        gas_before  += gas_submit;
+        total_stake += stake;
+        gas_tt      += tick_tock(false);
+        wait_some();
+
+    }
+
+    ;; Now poor cats go
+
+    repeat( min_validators - fat_cats ) {
+
+        int stake    = max(min_stake,min(fat_stake >> 2, valid_stake(total_stake)));
+        int factor   = valid_factor();
+        int adnl     = random();
+
+        (int priv,
+         int pub)    = pdict~generate_keypair_not_in();
+
+        (int gas_submit,
+        slice src)   = submit_custom_stake(false, 0, null(),
+                                           0, stake_at,
+                                           stake,valid_factor(),
+                                           priv, pub, adnl);
+
+        sdict~store_sorted_stake(stake, factor, now(), pub, src, adnl);
+        gas_before  += gas_submit;
+        total_stake += stake;
+        gas_tt      += tick_tock(false);
+        wait_some();
+
+    }
+
+    if( now() < elect_close ) {
+        set_now(elect_close);
+        gas_tt += tick_tock(false);
+    }
+
+    var (gas_lookup,
+         stack)       = invoke_method(participant_list_extended, []);
+
+    ;; Should fail
+    throw_unless(304, stack.at(5));
+    ;; Nominal total stake should be way higher.
+    throw_unless(305, total_stake > min_total);
+    {-
+      Heck i don't like this test.
+      Feels like this real_stake concept has way
+      too fuzzy testing conditions.
+      Maybe i'll get back to it
+      after successfull elections test
+    -}
+
+    return gas_before + gas_tt + gas_lookup;
+}
+
+int __test_successfull_elections() {
+
+    default_address();
+    default_config();
+
+    int gas_before     = assert_no_active_elections(300);
+    int gas_tt         = tick_tock(false);
+    int gas_elect      = 0;
+    int total_stake    = 0;
+    int finished?      = false;
+
+    cell pdict         = new_dict();
+    cell sdict         = new_dict();
+    var (gas_announce,
+    stake_at)          = assert_elections_announced(301);
+
+    gas_announce      += gas_announce;
+
+    ;; We stake till it's over
+    do {
+        int stake  = valid_stake(total_stake);
+        int factor = valid_factor();
+        int adnl   = rand(2) ? random() : 0;
+
+        (int priv,
+         int pub)  = pdict~generate_keypair_not_in();
+
+        (int gas_submit,
+        slice src) = submit_custom_stake(false, 0, null(),
+                                         0, stake_at,
+                                         stake,factor,
+                                         priv, pub, adnl);
+
+
+        ;; Keeping track of stakes sorted same as in elector try_elect
+        sdict~store_sorted_stake(stake, factor, now(), pub, src, adnl);
+
+        wait_some();
+        total_stake += stake;
+        gas_tt      += tick_tock(false);
+        gas_elect   += gas_submit;
+        ;; c5 register get's cleared here
+        var (gas_lookup,
+         stack)      = invoke_method(participant_list_extended, []);
+        gas_elect   += gas_lookup;
+
+        finished?    = stack.at(6);
+
+    } until( finished? );
+
+    ;; That's why we set it back after finish.
+    set_c5(get_prev_c5());
+
+    cell vset = assert_elections_successfull_msg(400, stake_at);
+
+    (int elect_start,
+     int elect_end,
+     int total_vldtrs,
+     int total_main,
+     int total_weight,
+     cell vdesc)      = vset.parse_vset(500);
+
+    (int max_vldrs,
+     int max_main,
+     int min_vldtrs)  = get_validators_numbers();
+
+    (int elect_for,
+     int start_before,
+     int end_before,
+     int held_for)    = get_validation_times();
+
+
+    throw_unless(302, elect_start == max(now() + end_before - 60, stake_at));
+    throw_unless(303, elect_end   == elect_start + elect_for);
+
+    (tuple unpacked,
+     int p_cnt)       = sdict.unpack_sorted_stakes(get_max_stake());
+
+    (int best_stake,
+     int best_num,
+     int min_stake)   = unpacked.calc_best_stake(min_vldtrs, max_vldrs, p_cnt);
+
+     throw_unless(304, total_vldtrs == best_num);
+     throw_unless(305, total_main   == min(best_num, max_main));
+
+    int v_idx         = 0;
+    int total_real    = 0;
+    int res_total     = 0;
+    int res_tw        = 0;
+
+    {-
+      Totally forgot about the past eleciton verification in this case.
+      Only realised that while doing vset update tests
+      where past_elections is everywhere.
+    -}
+    var (gas_past, stack) = invoke_method(past_elections, []);
+    var (found_past?,
+         cur_elections)  = stack.first().find_by_id(stake_at);
+    throw_unless(306, found_past?);
+    ;; unfreeze_at
+    throw_unless(307, cur_elections.at(1) == elect_start + elect_for + held_for);
+    throw_unless(308, cur_elections.at(2) == held_for);
+    throw_unless(309, cur_elections.at(3) == vset.cell_hash());
+
+    cell frozen_stakes = cur_elections.at(4);
+
+    do {
+        [int stake, int factor, int pub, int src, int adnl]   = unpacked~list_next();
+
+        int  refund  = stake;
+
+        if ( v_idx < best_num ) {
+            int true_stake = min(stake, (factor * min_stake) >> 16 );
+            int weight     = (true_stake << 60) / best_stake;
+
+            (int res_pub,
+             int res_weight,
+             int res_adnl) = vdesc.pick_vdesc(600, v_idx);
+
+            ;; Checking that expected parameters match resutling ones
+            throw_unless(310, pub    == res_pub);
+            throw_unless(311, weight == res_weight);
+            throw_unless(312, adnl   == res_adnl);
+
+            (int fz_found?,
+             int fz_src,
+             int fz_weight,
+             int fz_stake,
+             _)            = frozen_stakes.load_frozen(pub);
+
+             throw_unless(313, fz_found?);
+             throw_unless(314, fz_src == src);
+             throw_unless(315, fz_weight == weight);
+             throw_unless(316, fz_stake  == true_stake);
+
+            refund        -= true_stake;
+            total_real    += true_stake;
+            res_tw        += weight;
+        }
+        else {
+            ;; Just in case checking that there are no extra ids in validators or frozen.
+            (_, int found?) = vdesc.udict_get?(16, v_idx);
+            throw_if(317, found?);
+            (_, found?)     = frozen_stakes.udict_get?(256, pub);
+            throw_if(318, found?);
+        }
+
+        if (refund) {
+           (int gas_lookup,
+            int res_refund) = compute_return_helper(src);
+           throw_unless(319, refund == res_refund);
+           gas_elect += gas_lookup;
+        }
+
+        v_idx += 1;
+
+    } until( unpacked.null?() );
+
+    throw_unless(320, total_real == best_stake);
+    throw_unless(321, total_real == cur_elections.at(5));
+    throw_unless(322, res_tw == total_weight);
+
+   return gas_before + gas_tt + gas_elect + gas_past;
+}

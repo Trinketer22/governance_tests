@@ -1,0 +1,91 @@
+const int op::update_config_parameter = 0x43665021;
+;;const int op::update_config_code = 0x4e436f64; ;;TODO
+const int op::update_config_key = 0x50624b21;
+const int op::update_elector_code = 0x4e43ef05;
+const int op::vote_for_config_proposal = 0x566f7465;
+;;const int op::vote_for_config_proposal_from_elector = 0x13245678; ;;TODO
+;;const int op::response::vote_for_config_proposal = (op::vote_for_config_proposal + 0x80000000);
+const int op::set_next_validator_set = 0x4e565354;
+const int op::response::update_vset_confirm = 0xee764f4b;
+const int op::response::update_vset_reject = 0xee764f6f;
+const int op::new_voting_proposal = 0x6e565052;
+;;const int op::response::proposal_accepted = (op::new_voting_proposal + 0x80000000);
+const int op::response::proposal_accepted = 0xee565052; ;; Seems like dynamic expressions don't work in const declaration.
+const int op::response::vote_result = 0xd6745240;
+const int op::response::stake_rejected = 0xee6f454c;
+const int op::not_allowed = 0xfffffffe;
+const int op::not_supported = 0xffffffff;
+const int op::response::stake_recover = 0xf96f7324;
+
+const int op::response::stake_accepted = 0xf374484c;
+const int op::new_stake = 0x4e73744b;
+const int op::recover_stake = 0x47657424;
+const int op::new_complaint = 0x52674370;
+const int op::response::new_complaint = 0xf2676350;
+const int op::vote_for_complaint = 0x56744370;
+
+const int op::set_new_code = 0x4e436f64;
+;;const int op::response::new_code_set = (op::set_new_code + 0x80000000);
+const int op::response::new_code_set = 0xce436f64;
+
+const int tag::signature_challenge = 0x566f7445;
+const int tag::stake_application = 0x654c5074;
+const int tag::complaint = 0x56744350;
+const int tag::ed25519_pubkey = 0x8e81278a;
+
+const int error::proposal::old_mismatch = 0xe2646356;
+const int error::proposal::mandatory_nullified = 0xcd506e6c;
+const int error::proposal::too_deep = 0xc2616456;
+const int error::proposal::critical_flag_missing = 0xc3726954;
+const int error::proposal::expired = 0xc5787069;
+const int error::proposal::critical_flag_mismatch = 0xc3726955;
+const int error::proposal::already_exists = 0xc16c7245;
+const int error::proposal::insufficient_fee = 0xf0617924;
+const int error::unauthorized = 0x33440022; ;;TODO
+const int error::expired_vset = 0x13550021;
+const int error::no_elected_set = 0x7707; ;;TODO
+const int error::validator_params_mismatch = 0x7708; ;;TODO
+
+
+const int error::complaint_vote::tag_mismatch = 37;
+const int error::complaint_vote::sig_mismatch = 34;
+
+
+const int ONECOIN = 1000000000;
+
+const int config_params::config_address = 0;
+const int config_params::elector_address = 1;
+const int config_params::mandatory_params = 9;
+const int config_params::critical_params = 10;
+const int config_params::voting_setup = 11;
+const int config_params::complaint_prices = 13;
+const int config_params::validation_times = 15;
+const int config_params::validators_numbers = 16;
+const int config_params::validators_stakes = 17;
+const int config_params::current_validators_set = 34;
+const int config_params::next_validators_set = 36;
+
+const int special_params::set_config_key = -999;
+const int special_params::update_config_code = -1000;
+const int special_params::update_elector_code = -1001;
+const int special_params::signed_votes_disabled = -1002;
+const int special_params::config_multikey = -1003;
+
+const int stake_reject::no_elections       = 0;
+const int stake_reject::not_masterchain    = 0;
+const int stake_reject::elections_finished = 0;
+const int stake_reject::invalid_signature  = 1;
+const int stake_reject::low_fraction       = 2;
+const int stake_reject::wrong_elections    = 3;
+const int stake_reject::pubkey_addr_used   = 4;
+const int stake_reject::stake_too_low      = 5;
+const int stake_reject::factor_too_low     = 6;
+
+const int vote_result::accepted            = 1;
+const int vote_result::finished            = 2;
+const int vote_result::bad_comp_hash       = -1;
+const int vote_result::wrong_elections     = -2;
+const int vote_result::old_vset            = -3;
+const int vote_result::already_voted       = 0;
+
+const int now_const = 1667388240; ;; Expired timestamp from data.fif

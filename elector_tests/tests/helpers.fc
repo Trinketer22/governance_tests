@@ -1,0 +1,922 @@
+#include "constants.fc";
+#include "config-helpers.fc";
+int equal_slices (slice a, slice b) asm "SDEQ";
+int tuple_length( tuple t ) asm "TLEN";
+int get_gl() asm "GASLIMITSTEMP DROP";
+slice sign_data(slice data, int priv_key) asm "SIGNS";
+() set_c5(cell c5) impure asm "c5 POP";
+
+int list_len(tuple t) {
+    int len = 0;
+
+    if( t.tuple_length() > 0 ) {
+        do {
+            t~list_next();
+            len += 1;
+        } until(t.null?());
+    }
+
+    return len;
+}
+
+cell default_validators() impure inline {
+    return begin_cell().store_uint(0x12,8)
+                        .store_uint(now_const - 1000,32) ;; Valid since
+                        .store_uint(now_const - 100,32) ;; Valid till
+                        .store_uint(1,16) ;; Total validators
+                        .store_uint(1,16) ;; Total main validators
+                        .store_uint(0,64) ;; Total weight
+                        .store_uint(0,1)  ;; Validators description (Hashmap 16 ValidatorDescr) = ValidatorSet;
+                       .end_cell();
+}
+
+cell default_validation_times() impure inline {
+
+    return begin_cell().store_int(10000,32) ;;elected_for
+                        .store_int(8000,32);;election_start_before
+                        .store_int(2000,32);;election_end_before
+                        .store_int(8000,32);;stake_held_for
+                       .end_cell();
+
+}
+
+cell validators_set(int valid_since, int valid_till, int total_count, int total_main, int total_weight, cell desc) {
+    return begin_cell().store_uint(0x12,8)
+                        .store_uint(valid_since,32)
+                        .store_uint(valid_till, 32)
+                        .store_uint(total_count,16)
+                        .store_uint(min(total_main, total_count), 16)
+                        .store_uint(total_weight, 64)
+                        .store_dict(desc)
+                       .end_cell();
+}
+
+(cell, cell, cell, int, int, int) load_test_data() inline_ref {
+  var cs = get_data().begin_parse();
+  var res = (cs~load_dict(), cs~load_dict(), cs~load_dict(), cs~load_grams(), cs~load_uint(32), cs~load_uint(256));
+  cs.end_parse();
+  return res;
+}
+
+
+
+_ default_config() impure inline_ref {
+    tuple config_params = null();
+
+    (_, int elector_address)   = my_address().parse_std_addr();
+    cell elector_addr_cell     = begin_cell().store_uint(elector_address,256).end_cell();
+    config_params              = cons([config_params::elector_address,elector_addr_cell],
+                                       config_params);
+
+    (_, int config_address)    = generate_internal_address().parse_std_addr();
+    cell config_addr_cell      = begin_cell().store_uint(config_address,256).end_cell();
+    config_params              = cons([config_params::config_address,config_addr_cell],
+                                       config_params);
+
+    int max_validators    = 100;
+    int max_main          = max_validators;
+    int min_validators    = 5;
+    cell validators_cell  = begin_cell().store_uint(max_validators, 16)
+                                         .store_uint(max_main,16)
+                                         .store_uint(min_validators,16)
+                                        .end_cell();
+    config_params         = cons([config_params::validators_numbers, validators_cell],
+                                  config_params);
+
+    ;; Stake parameters are specified in TONs
+    int min_stake         = 10000 * ONECOIN;
+    int max_stake         = 500000 * ONECOIN;
+    int min_total_stake   = 2000000 * ONECOIN;
+    int max_stake_factor  = (27 << 16) / 10; ;; ~2.7
+    cell stakes_cell      = begin_cell().store_grams(min_stake)
+                                         .store_grams(max_stake)
+                                         .store_grams(min_total_stake)
+                                         .store_uint(max_stake_factor, 32)
+                            .end_cell();
+    config_params         = cons([config_params::validators_stakes,
+                                  stakes_cell],config_params);
+    config_params         = cons([config_params::current_validators_set,
+                                  default_validators()],config_params);
+
+    config_params         = cons([config_params::validation_times,
+                                  default_validation_times()], config_params);
+
+    set_config_multi(config_params);
+
+    randomize_lt();
+
+}
+
+slice default_address() impure inline_ref {
+    ;; Contract has to be on masterchain
+    ;; my_address() by default is on basechain.
+    slice new_addr = generate_internal_address_with_custom_data(0, -1, random());
+    set_my_address(new_addr);
+    return new_addr;
+}
+
+cell validator_msg(int ton_amount, builder body) impure inline {
+    ;; Imitates validator fee msg (src_addr = 0)
+    slice addr = generate_internal_address_with_custom_data(0, -1, 0);
+    return generate_internal_message_custom(0, ton_amount, 0, body, addr, null(), 0);
+}
+
+(int, int) add_bonuses(int count, int max_range, int with_body?, int from_validator?) impure inline {
+    int total     = 0;
+    int gas_total = 0;
+    builder body  = with_body? ? generate_internal_message_body(0, rand(12345) + 1) : begin_cell();
+
+    repeat(count) {
+        int  msg_val = ONECOIN * (rand(max_range) + 1);
+        cell msg     = from_validator? ? validator_msg(msg_val, body) : generate_internal_message(false, msg_val, false, body);
+        (int gas, _) = invoke_method(recv_internal, [msg_val, msg, body.end_cell().begin_parse()]);
+        total       += msg_val;
+        gas_total   += gas;
+    }
+
+    return (gas_total, total);
+}
+
+int tick_tock(int expect_fail?) impure inline_ref {
+
+    int gas = 0;
+    if ( expect_fail? ) {
+        gas      = invoke_method_expect_fail(run_ticktock, [ true ]);
+    }
+    else {
+        (gas, _) = invoke_method(run_ticktock, [ true ]);
+    }
+
+    return gas;
+}
+
+(int, int, int) get_validators_numbers() {
+    slice vn = config_param(config_params::validators_numbers).begin_parse();
+    return (vn~load_uint(16), vn~load_uint(16), vn~load_uint(16));
+}
+
+int get_min_validators() {
+    ( _, _, int min ) = get_validators_numbers();
+    return min;
+}
+
+(int, int, int, int) get_validation_times() impure inline {
+    slice vt = config_param(config_params::validation_times).begin_parse();
+    return (vt~load_int(32), ;; elected_for
+            vt~load_int(32), ;; start_before
+            vt~load_int(32), ;; end_before
+            vt~load_int(32)); ;; held_for
+}
+
+int time_till_next_elections(cell vset) impure inline {
+
+    if ( vset.null?() ) {
+        vset = config_param(config_params::current_validators_set);
+    }
+
+    (_, int start_before, _, _) = get_validation_times();
+
+    return vset.begin_parse().skip_bits(8 + 32).preload_uint(32) - start_before;
+}
+
+cell new_vset(int count, int weight, cell desc) impure inline {
+    ;; Creates new valid validators set with description cell specified.
+    (int elect_for, int start_beofre, int end_before, _) = get_validation_times();
+    (int max_vldtrs, int max_main, int min_vldtrs)       = get_validators_numbers();
+
+    int start = now() + end_before - 60;
+
+    ifnot( count ) {
+        count = rand(max_vldtrs - min_vldtrs) + min_vldtrs + 1;
+    }
+
+    return validators_set(start, start + elect_for, count, min(max_main, count), weight, desc);
+}
+
+int assert_no_active_elections(int exception_code) impure inline {
+    var (gas, stack) = invoke_method(active_election_id, []);
+    throw_unless(exception_code, stack.first() == 0);
+
+    return gas;
+}
+
+(int, int) assert_elections_announced(int exception_code) impure inline {
+    var (gas, stack) = invoke_method(active_election_id, []);
+    int elect_at = stack.first();
+    throw_unless(exception_code, elect_at != 0);
+
+    return (gas, elect_at);
+}
+
+(int, int) announce_test_elections(int exception_code) impure inline {
+    int gas = assert_no_active_elections(exception_code);
+    int tt  = tick_tock(false);
+    var (gas_announce, elect_at) = assert_elections_announced(exception_code + 1);
+
+    return (gas + tt + gas_announce, elect_at);
+}
+
+slice generate_different_address(int workchain, slice orig) impure inline {
+    slice new_addr = generate_internal_address_with_custom_data(0, workchain, random());
+
+    ;; There is some slim chance to get same address and pass some important test with it.
+    while( equal_slices(new_addr, orig) ) {
+        new_addr   = generate_internal_address_with_custom_data(0, workchain, random());
+    }
+
+    return new_addr;
+}
+
+int generate_different(int old) impure inline {
+    int new_val = random();
+
+    while( new_val == old ) {
+        new_val = random();
+    }
+
+    return new_val;
+}
+
+
+tuple  assert_response_msg_from( tuple action, int code, slice src, int exp_mode, int exp_op, int exp_qid, int exp_status, int check_status?, int check_value?) impure inline {
+
+    ;; Action is a message
+    throw_unless(code + 1, action.first() == 0);
+    ;; Message mode
+    throw_unless(code + 2, action.third() == exp_mode);
+    tuple parsed  = unsafe_tuple(action.second().parse_internal_message());
+     ;; Message is sent back to requesting address
+    throw_unless(code + 3, equal_slices(parsed.at(4), src));
+    slice ds      = parsed.at(8);
+    throw_unless(code + 4, exp_op     == ds~load_uint(32));
+    throw_unless(code + 5, exp_qid    == ds~load_uint(64));
+
+    if ( check_status? ) {
+        throw_unless(code + 6, exp_status == ds~load_uint(32));
+    }
+
+    if ( check_value? ) {
+        throw_unless(code + 7, check_value? == parsed.at(5));
+    }
+
+    return parsed;
+}
+
+tuple  assert_response_msg( int code, slice src, int exp_mode, int exp_op, int exp_qid, int exp_status, int check_status?, int check_value?) impure inline_ref {
+    ;; Generic message handler
+    tuple actions = parse_c5();
+    ;; Only one message
+    throw_if(code, actions.null?());
+    throw_unless(code + 1, actions.tuple_length() == 1);
+
+    return actions.first().assert_response_msg_from(code + 2, src, exp_mode, exp_op, exp_qid, exp_status, check_status?, check_value?);
+
+}
+
+tuple  assert_stake_reject(int code, slice src, int query_id, int expected_reason) impure inline {
+    return assert_response_msg(code, src, 64, op::response::stake_rejected, query_id, expected_reason, true, false);
+}
+
+tuple  assert_stake_accepted(int code, slice src, int query_id) impure inline {
+    return assert_response_msg(code, src, 2, op::response::stake_accepted, query_id, 0, true, ONECOIN);
+}
+
+tuple assert_recovery_not_allowed(int code, slice src, int query_id) impure inline {
+    return assert_response_msg(code, src, 64, op::not_allowed, query_id, op::recover_stake, true, false);
+}
+
+tuple assert_recovery_successfull(int code, slice src, int query_id, int exp_sum) impure inline {
+    return assert_response_msg(code, src, 64, op::response::stake_recover, query_id, 0, false, exp_sum);
+}
+
+tuple assert_upgrade_not_allowed(int code, slice src, int query_id) impure inline {
+    return assert_response_msg(code, src, 64, op::not_supported, query_id, op::set_new_code, true, false);
+}
+
+tuple assert_upgrade_successfull(int code, slice src, int query_id) impure inline {
+
+    tuple actions = parse_c5();
+    throw_if(code, actions.null?());
+    ;; Prior to message set_code action is triggered.
+    throw_unless(code + 1, actions.tuple_length() == 2);
+    ;; Action type is set_code
+    ;; Possible to go further and verify code contents
+    throw_unless(code + 2, actions.at(0).at(0) == 1);
+    ;; Begin processing response message
+    return actions.at(1).assert_response_msg_from(code + 3, src, 64, op::response::new_code_set, query_id, op::set_new_code, true, false);
+}
+
+cell assert_elections_successfull_msg( int code, int stake_at ) impure inline {
+    ;; Checks message format returns validators set cell
+
+    int config_part   = config_param(config_params::config_address).begin_parse().preload_uint(256);
+    slice config_addr = generate_internal_address_with_custom_data(0, -1, config_part);
+
+    tuple msg_tuple   = assert_response_msg(code, config_addr, 1, op::set_next_validator_set, stake_at, 0, false, false);
+    slice msg_body    = msg_tuple.at(8);
+
+    ;; Returning vset cell
+    return msg_body~load_ref();
+}
+
+(int, int, int, int, int, cell) parse_vset (cell vcell, int code) impure inline {
+   slice vs = vcell.begin_parse();
+   int flag = vs~load_uint(8);
+   throw_unless(code, flag == 0x12);
+   return (vs~load_uint(32), ;; start
+           vs~load_uint(32), ;; stop
+           vs~load_uint(16), ;; total validators
+           vs~load_uint(16), ;; total main validators
+           vs~load_uint(64), ;; total weight
+           vs~load_dict()); ;; validators descr
+}
+
+(int, int, int) parse_vdesc (slice vs, int code) impure inline {
+
+    int flag      = vs~load_uint(8);
+    int has_adnl? = ( flag == 0x73 );
+    int adnl      = 0;
+    throw_unless(code + 1, has_adnl? | (flag == 0x53));
+
+    int tag  = vs~load_uint(32);
+    throw_unless(code + 2, tag == tag::ed25519_pubkey);
+
+    int pub  =  vs~load_uint(256);
+    int wt   =  vs~load_uint(64);
+
+    if ( has_adnl? ) {
+        adnl = vs~load_uint(256);
+    }
+    else {
+        ;; vdesc should end then.
+        throw_unless(code + 3, vs.slice_bits() == 0);
+    }
+
+    return (pub, wt, adnl);
+
+}
+
+
+(int, int, int) pick_vdesc(cell vdesc, int code, int idx) {
+    (slice vs, int found? ) = vdesc.udict_get?(16, idx);
+    throw_unless(code, found?);
+    return vs.parse_vdesc(code);
+}
+
+cell load_vdesc(cell vcell, int code) {
+
+    (_, _, _, _, _, cell vdesc) = vcell.parse_vset(code);
+
+    return vdesc;
+}
+
+(int, int, int, int, int) load_frozen (cell fdict, int idx) impure inline {
+
+   var (vs, found?) = fdict.udict_get?(256, idx);
+
+   int src_addr = 0;
+   int weight   = 0;
+   int stake    = 0;
+   int ban?     = false;
+
+   if ( found? ) {
+       src_addr = vs~load_uint(256);
+       weight   = vs~load_uint(64);
+       stake    = vs~load_grams();
+       ban?     = vs~load_int(1);
+   }
+
+   return (found?, src_addr,
+           weight, stake, ban?);
+
+}
+
+int get_min_stake() impure inline {
+    slice cs = config_param(config_params::validators_stakes).begin_parse();
+    return cs~load_grams();
+}
+
+(int, int, int, int) get_validators_stakes() impure inline {
+    slice vs = config_param(config_params::validators_stakes).begin_parse();
+    return(vs~load_grams(), vs~load_grams(), vs~load_grams(), vs~load_uint(32));
+}
+
+int get_max_stake() impure inline {
+    (_, int max_stake, _, _) = get_validators_stakes();
+    return max_stake;
+}
+
+int get_min_total_stake() impure inline {
+    (_, _, int min_total, _) = get_validators_stakes();
+    return min_total;
+}
+
+int valid_stake(int total) impure inline {
+    var (min_stake, max_stake, _, _) = get_validators_stakes();
+    min_stake = max(min_stake, total >> 12);
+    ;; Stake > max_stake will be creditated for return so it's ok.
+    return rand(max_stake) + min_stake;
+    ;; return min(stake, max_stake);
+}
+
+int valid_stake_from(int min_stake, int total) impure inline {
+    min_stake = max(min_stake, total >> 12);
+    return min_stake + rand(12345);
+}
+
+_ wait_some() impure inline {
+    ;; From 1 to 30 sec time pass
+    set_now(now() + rand(30) + 1);
+}
+
+int  wait_till(int time) impure inline {
+    int delta    = 0;
+    int cur_time = now();
+
+    if ( cur_time < time ) {
+        set_now(time);
+        delta = time - cur_time;
+    }
+
+    return delta;
+}
+
+int invalid_stake(int larger?) impure inline {
+    var (min_stake, max_stake, _, _) = get_validators_stakes();
+    int stake  = 0;
+
+    if (larger?) {
+        stake = rand(max_stake) + max_stake + 1;
+    }
+    else {
+        stake = rand(min_stake); ;; Returns from 0 to arg - 1
+    }
+
+    return stake;
+
+}
+
+int valid_factor() impure inline_ref {
+    ;; slice cs = config_param(config_params::validators_stakes).begin_parse();
+    int min_factor = 1 << 16;
+    var (_, _, _,int max_factor) = get_validators_stakes();
+    return rand(max_factor - min_factor) + min_factor;
+}
+
+;; int priv_to_pub(int priv_key) asm "PRIVTOPUB";
+
+;; Signs hash with public key
+;;int sign(int hash, int priv_key) asm "SIGN";
+
+(int,int) generate_keypair() impure inline {
+    int priv = random();
+
+    return (priv, priv.priv_to_pub());
+}
+
+(cell, (int, int)) generate_keypair_not_in(cell kdict) impure inline {
+    {-
+      Dedicated to all my paranoid bros out there.
+      Do u expect me to trust some random randmoness?!
+      HELL NO!
+      Always keep tinfoil hat ready. No pasaran!
+    -}
+
+    int status? = false;
+    int priv    = 0;
+    int pub     = 0;
+
+    do {
+        (priv, pub)  = generate_keypair();
+        (_, status?) = kdict.udict_get?(256, pub);
+    } until( ~ status? );
+
+    kdict~udict_set_builder(256, pub, begin_cell().store_uint(priv, 256));
+
+    return (kdict, (priv, pub));
+}
+
+builder generate_new_stake_message(int query_id, int privkey,
+                                   int pubkey, int stake_at,
+                                   int factor, slice s_addr, int adnl_addr) impure inline_ref {
+
+    (int src_ws, int src_addr) = parse_std_addr(s_addr);
+    cell sign_cell = begin_cell().store_uint(tag::stake_application, 32)
+                                 .store_uint(stake_at, 32)
+                                 .store_uint(factor, 32)
+                                 .store_uint(src_addr, 256)
+                                 .store_uint(adnl_addr, 256)
+                     .end_cell();
+
+    cell signature = begin_cell().store_slice(sign_data(sign_cell.begin_parse(), privkey)).end_cell();
+
+    return begin_cell()
+            .store_uint(op::new_stake, 32)
+            .store_uint(query_id,64)
+            .store_uint(pubkey, 256)
+            .store_uint(stake_at, 32)
+            .store_uint(factor, 32)
+            .store_uint(adnl_addr, 256)
+            .store_ref(signature);
+
+
+
+}
+
+(int, slice, int, int) lookup_participant?(cell participants, int key) impure inline {
+
+    (slice participant, int got?) = participants.udict_get?(256, key);
+    slice src_addr = null();
+    int priv       = 0;
+
+    if ( got? ) {
+        return( got?, participant~load_msg_addr(), participant~load_grams(), participant~load_uint(256));
+    }
+
+    return (got?, null(), 0, 0);
+}
+
+(int, slice ) random_elem(cell dict, int key_size) impure inline {
+
+    key_size        = min(256, key_size);
+    int min_or_max? = rand(2) - 1; ;; From -1 to 0 t/f;
+    int status?     = false;
+    slice res       = null();
+    int id          = 0; ;;key_size < 256 ? rand( (1 << key_size) - 1) : random();
+    int prev_id     = 0;
+
+    if ( ~ dict.dict_empty?() ) {
+        (int max_id, _, _) = dict.udict_get_max?(key_size);
+        id = rand(max_id + 1); ;; From 0 to max_id
+        do {
+            prev_id = id;
+            (id, res, status?)  = min_or_max? ? dict.udict_get_nexteq?(key_size, id) : dict.udict_get_preveq?(key_size, id);
+            ;; Changing search direction in case nothing found.
+            if ( ~ status? ) {
+                id = prev_id;
+                min_or_max? = ~ min_or_max?;
+            }
+        } until( status? );
+    }
+    else {
+        id = false;
+    }
+
+    return  (id, res);
+}
+
+(cell, (int, int)) submit_valid_stake(cell pkeys,int code, int total_stake) impure method_id {
+    int query_id      = 0;
+    int adnl          = random();
+    int stake         = valid_stake(total_stake);
+    int factor        = valid_factor();
+    int ton_amount    = stake + ONECOIN;
+    slice src_addr    = generate_internal_address_with_custom_data(0, -1, random());
+    var (priv, pub)   = generate_keypair();
+    var(gas_announce,
+        stake_at)     = assert_elections_announced(code);
+
+    var (vdata,
+    participated?)    = pkeys.udict_get?(256, pub);
+
+    {-
+      I don't know what's the actual posibility
+      of getting pubkey collisions within test scenario.
+      Yet still those tests are very important so
+      i'm trying to not take any chances.
+    -}
+
+    if ( participated? ) {
+        src_addr = vdata~load_msg_addr();
+        priv     = vdata~load_uint(256);
+    }
+    else {
+        ;; Saving data to dict.
+        pkeys~udict_set_builder(256, pub, begin_cell().store_slice(src_addr).store_uint(priv, 256));
+    }
+
+    builder stake_msg = generate_new_stake_message(query_id, priv,
+                                                   pub, stake_at,
+                                                   factor, src_addr,
+                                                   adnl);
+
+    cell msg          = generate_internal_message_custom(0, ton_amount, 0,
+                                                         stake_msg, src_addr,
+                                                         null(), 0);
+
+    var (gas_success,
+         stack)       = invoke_method(recv_internal,
+                                          [ton_amount, msg,
+                                           stake_msg.end_cell().begin_parse()
+                                          ]);
+    {- Should succeed.
+     assert_no_actions();
+     On the other hand this submit_valid_stake not assert_valid_stake
+     so check should be done in the test itself.
+    -}
+
+    return (pkeys, (gas_announce + gas_success, stake));
+}
+
+(cell, (int, int)) submit_stakes_from(cell pdict, int code, int n, int stake_total) impure inline {
+   int gas_total = 0;
+   cell pdict      = new_dict();
+   repeat( n ) {
+       var(gas_submit, stake) = pdict~submit_valid_stake(code, stake_total);
+       gas_total   += gas_submit;
+       stake_total += stake;
+   }
+
+   return (pdict, (gas_total, stake_total));
+
+}
+
+(int, int) submit_stakes(int code,int n) impure inline {
+   cell pdict = new_dict();
+   return pdict~submit_stakes_from(code, n, 0);
+}
+
+(int, tuple) find_by_id(tuple t, int id) impure inline {
+    ;; Generic proc for searcing [id, whatever,...,] elements lisp-list
+    int found? = false;
+    tuple el   = empty_tuple();
+
+    if ( ~ t.null?() ){
+        do {
+            el     = t~list_next();
+            found? = ( id == el.first() );
+        } until( found? | t.null?() );
+    }
+
+    return (found?, el);
+}
+
+(int, tuple) find_participant(tuple plist, int id) impure inline {
+    (int found?, tuple pt) = plist.find_by_id(id);
+    return (found?, found? ? pt.second() : null());
+}
+
+int equal_plists?(tuple t1, tuple t2) impure inline {
+
+    int equal? = ( t1.tuple_length() == t2.tuple_length() );
+
+    while( equal? & (~ t1.null?()) ){
+        tuple pt1 = t1~list_next();
+        tuple pt2 = t2~list_next();
+        int i     = 0;
+        ;; Comparing ids
+        equal?    = ( pt1.first() == pt2.first() );
+        ;; Comparing data
+        tuple pd1 = pt1.second();
+        tuple pd2 = pt2.second();
+        int dlen  = pd1.tuple_length();
+        while( equal? & (i < dlen) ) {
+            equal? = ( pd1.at(i) == pd2.at(i) );
+            i     += 1;
+        }
+    }
+
+    return equal?;
+}
+
+(int, slice) submit_custom_stake(int expect_error?, int err_code, slice src_addr, int query_id, int stake_at, int stake, int factor, int priv, int pub, int adnl) impure method_id {
+
+    int ton_amount    = stake + ONECOIN;
+
+    if ( src_addr.null?() ) {
+        src_addr      =  generate_internal_address_with_custom_data(0, -1, random());
+    }
+
+    builder stake_msg = generate_new_stake_message(query_id, priv,
+                                                   pub, stake_at,
+                                                   factor, src_addr,
+                                                   adnl);
+
+    cell msg          = generate_internal_message_custom(0, ton_amount, 0,
+                                                         stake_msg, src_addr,
+                                                         null(), 0);
+
+    var (gas_success,
+         stack)       = invoke_method(recv_internal,
+                                          [ton_amount, msg,
+                                           stake_msg.end_cell().begin_parse()
+                                          ]);
+    if ( expect_error? ) {
+        assert_stake_reject(500, src_addr, query_id, err_code);
+    }
+    else {
+        ;; Should succeed.
+        if ( query_id > 0 ) {
+            assert_stake_accepted(600, src_addr, query_id);
+        }
+        else {
+            assert_no_actions();
+        }
+    }
+
+    return (gas_success, src_addr);
+
+}
+
+(int, int, cell) conduct_valid_elections_verbose(int code, int stake_at) impure inline {
+    int  total_gas           = 0;
+    int  total_stake         = 0;
+    int  finished?           = false;
+    cell participants        = new_dict();
+
+    ;; Stake it till you make it
+    do {
+        (int gas, int stake) = participants~submit_valid_stake(code, total_stake);
+        total_gas           += gas + tick_tock(false);
+        total_stake         += stake;
+        ;; Time has to be ticking too.
+        wait_some();
+        ;; Checking elections state.
+        var (gas_plist,
+        stack)               = invoke_method(participant_list_extended, []);
+        finished?            = stack.at(6);
+
+    } until( finished? );
+
+    return (total_gas, total_stake, participants);
+
+}
+
+int conduct_valid_elections(int code) impure inline_ref {
+
+    var (gas_announce, stake_at) = assert_elections_announced(code);
+    var (gas_elect, _, _)        = conduct_valid_elections_verbose(code, stake_at);
+
+    return gas_announce + gas_elect;
+}
+
+(cell, (int, int)) stake_till(cell pdict, int code, int amount, int min_validators, int stake_total, int wait_time? ) impure inline_ref {
+
+    var (gas_total,
+        stake_at)    = assert_elections_announced(code + 1);
+    int  finished?   = false;
+    int  failed?     = false;
+
+    int  min_stake   = min_validators > 0 ? amount ^/ min_validators : 0;
+    int  v_count     = 0;
+    ;; Submit stakes till total_stake >= amount
+    do {
+        int factor   = valid_factor();
+        int stake    = valid_stake_from(min_stake, stake_total);
+        var (priv,
+             pub)    = pdict~generate_keypair_not_in();
+        var (gas_submit,
+             _)      = submit_custom_stake(false, 0, null(),
+                                           0, stake_at,
+                                           stake, factor,
+                                           priv, pub, 0);
+
+        int gas_tt   = tick_tock(false);
+
+        if(wait_time?) {
+            wait_some();
+        }
+
+        var (gas_lookup,
+             stack)  = invoke_method(participant_list_extended, []);
+
+        gas_total   += gas_submit + gas_tt + gas_lookup;
+        v_count     += 1;
+        stake_total  = stack.at(3);
+        finished?    = stack.at(6);
+    } until( (finished? | (stake_total >= amount))
+             & (v_count >= min_validators) );
+
+    throw_unless(code + 2, stake_total >= amount);
+
+    return (pdict, (gas_total, stake_total));
+}
+
+{-
+tuple elections_sort(tuple plist) impure method_id {
+    ;; Imitating stakes sort in try_elect
+    cell sdict = new_dict();
+
+    do {
+       (int pub, tuple stake_data) = plist~list_next().unpair();
+       slice key = begin_cell()
+                               .store_uint(stake_data.first(), 128) ;; stake
+                               .store_uint( - stake_data.second(), 32) ;; time
+                               .store_uint(pub, 256)
+                   end_cell().begin_parse();
+       sdict~dict_set_builder(128 + 32 + 256, key, begin_cell()
+                              .store_uint(
+    } until( plist.null?() )
+    return nil;
+}
+-}
+
+slice generate_sort_key(int stake, int time, int pub) impure inline {
+    return begin_cell().store_uint(stake, 128)
+                       .store_int( - time, 32)
+                       .store_uint(pub, 256)
+                      .end_cell().begin_parse();
+
+}
+
+(cell, slice) store_sorted_stake(cell sdict, int stake, int factor, int time, int pub, slice src_addr, int adnl) impure inline_ref {
+    (_, int addr) = parse_std_addr(src_addr);
+    slice key = generate_sort_key(stake, time, pub);
+    sdict~dict_set_builder(128 + 32 + 256,
+                           key,
+                           begin_cell().store_uint(factor, 32)
+                           .store_uint(addr, 256)
+                           .store_uint(adnl, 256));
+    return (sdict, key);
+}
+
+(tuple, int) unpack_sorted_stakes(cell sdict, int max_stake) impure inline {
+    tuple l = nil;
+    int   i = 0;
+    do {
+      var (key, cs, f) = sdict~dict::delete_get_min(128 + 32 + 256);
+      if (f) {
+        var (stake, _, pubkey) = (min(key~load_uint(128), max_stake), key~load_uint(32), key.preload_uint(256));
+        var (max_f, src, adnl) = (cs~load_uint(32), cs~load_uint(256), cs.preload_uint(256));
+        l = cons([stake, max_f, pubkey, src, adnl], l);
+        i += 1;
+      }
+    } until (~ f);
+
+    return (l, i);
+}
+
+int compute_test_total_stake(tuple l, int n, int m_stake) impure inline_ref {
+
+    int tot_stake = 0;
+    repeat (n) {
+      (tuple  h, l) = uncons(l);
+      int stake = h.at(0);
+      int max_f = h.at(1);
+      stake = min(stake, (max_f * m_stake) >> 16);
+      tot_stake += stake;
+    }
+    return tot_stake;
+}
+
+(int, int, int) calc_best_stake(tuple plist, int min_validators, int max_validators, int count) impure inline {
+    int best_stake = 0;
+    int m_stake    = 0;
+    int m_num      = 0;
+    tuple l1 = plist;
+    int i    = min_validators - 1;
+    count    = min(count, max_validators);
+
+    repeat(i) {
+        l1 = cdr(l1);
+    }
+
+    do {
+       int stake = l1~list_next().first();
+       i        += 1;
+       int total = compute_test_total_stake(plist, i, stake);
+       if ( total > best_stake ) {
+          (best_stake, m_num) = (total, i);
+       }
+
+    } until( i >= count );
+
+    if ( m_num > 0 ) {
+      l1 = plist;
+      repeat( m_num - 1 ) {
+        l1 = cdr(l1);
+      }
+
+      m_stake = car(l1).first();
+    }
+    return (best_stake, m_num, m_stake);
+}
+
+(int, int) compute_return_helper(int addr) impure inline {
+    var (gas, stack) = invoke_method(compute_returned_stake, [addr]);
+
+    return (gas, stack.first());
+}
+
+builder generate_recover_stake_msg(int query_id) impure inline {
+    return generate_internal_message_body(op::recover_stake, query_id);
+}
+
+builder generate_updgrade_code_msg(int query_id, cell code) impure inline {
+    return generate_internal_message_body(op::set_new_code, query_id).store_ref(code);
+}
+
+int assert_credit_tuple(tuple ct, int code, int expect_change?) impure inline_ref {
+    throw_if(code, ct.null?());
+    int gas_total = 0;
+    do {
+        (int addr, int credit_before, int credit_exp) = ct~list_next().untriple();
+        var (gas_credit, credit) = compute_return_helper(addr);
+        int cond?                = expect_change? ? (credit == credit_exp) : (credit == credit_before);
+        throw_unless(code + 1, cond?);
+
+        gas_total               += gas_credit;
+    } until ( ct.null?() );
+
+    return gas_total;
+}

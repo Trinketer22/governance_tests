@@ -1,0 +1,748 @@
+#include "constants.fc";
+
+int get_gl() asm "GASLIMITSTEMP DROP";
+int equal_slices (slice a, slice b) asm "SDEQ";
+int tuple_length( tuple t ) asm "TLEN";
+slice sign_data(slice data, int priv_key) asm "SIGNS";
+() set_c5(cell c5) impure asm "c5 POP";
+cell load_contract_code() asm """ "build/boc/contract.boc" file>B B>boc PUSHREF """;
+
+(int, int) parse_config_response(slice cr) {
+    return (cr~load_uint(32), cr~load_uint(64));
+}
+
+() set_my_address( slice addr ) impure asm
+    "c7 PUSH DUP FIRST"
+    "ROT"
+    "8 SETINDEX"
+    "0 SETINDEX"
+    "c7 POP" ;
+
+cell update_config() impure inline {
+    ;; Load config dict cell to be accessible via config_param functions
+    cell conf = get_data().begin_parse().preload_ref();
+    set_global_config(conf);
+
+    return conf;
+}
+
+cell set_contract_config(cell config) impure inline {
+    ;; Sets contract config cell
+
+    ;; Skip current config
+    (slice cs, _) = get_data().begin_parse().load_ref();
+    ;; Replacing config, but storing rest as is
+    cell new_data = begin_cell().store_ref(config).store_slice(cs).end_cell();
+    set_data(new_data);
+
+    return new_data;
+}
+
+_ default_config() impure inline_ref {
+    ;; Initial config load
+    update_config();
+    ;; We want real random to cover more code
+    randomize_lt();
+}
+
+_ default_address() impure inline_ref {
+    slice new_addr = generate_internal_address_with_custom_data(0, -1, random());
+    set_my_address(new_addr);
+}
+
+_ wait_some() impure inline {
+    ;; From 1 to 30 sec time pass
+    set_now(now() + rand(30) + 1);
+}
+
+int  wait_till(int time) impure inline {
+    int delta    = 0;
+    int cur_time = now();
+
+    if ( cur_time < time ) {
+        set_now(time);
+        delta = time - cur_time;
+    }
+
+    return delta;
+}
+
+slice get_elector_address() impure inline {
+    int el_addr   = config_param(config_params::elector_address).begin_parse().preload_uint(256);
+    return generate_internal_address_with_custom_data(0, -1, el_addr);
+}
+
+tuple assert_response_msg_from(tuple action, int code, slice src, int exp_op, int exp_mode, int exp_qid, int check_value?, int exp_value) impure inline {
+
+    ;; Action is a message
+    throw_unless(code + 1, action.first() == 0);
+    ;; Message mode
+    throw_unless(code + 2, action.third() == exp_mode);
+
+    tuple parsed  = unsafe_tuple(action.second().parse_internal_message());
+     ;; Message is sent back to requesting address
+    throw_unless(code + 3, equal_slices(parsed.at(4), src));
+    slice ds      = parsed.at(8);
+    ;; int op = ds.preload_uint(32);
+    ;; exp_op~dump();
+    ;; op~dump();
+    throw_unless(code + 4, exp_op     == ds~load_uint(32));
+    throw_unless(code + 5, exp_qid    == ds~load_uint(64));
+    ;; Check message value
+    if ( check_value? ) {
+        throw_unless(code + 6, exp_value == parsed.at(5));
+    }
+
+    return parsed;
+}
+
+tuple assert_response_msg(int code, slice src, int exp_op, int exp_mode, int exp_qid, int check_value?, int exp_value) impure inline_ref {
+
+    tuple actions = parse_c5();
+    throw_if(code, actions.null?());
+    throw_unless(code + 1, actions.tuple_length() == 1);
+    return actions.first().assert_response_msg_from(code + 10, src, exp_op, exp_mode, exp_qid, check_value?, exp_value);
+}
+
+
+
+tuple assert_update_vset(int accept?, int code, slice src, int query_id ) impure inline {
+    int op = accept? ? op::response::update_vset_confirm : op::response::update_vset_reject;
+    return assert_response_msg(code, src, op, 64, query_id, false, 0);
+}
+
+tuple assert_new_proposal(int code, slice src, int exp_op, int query_id, int price) impure inline {
+
+    tuple actions = parse_c5();
+    int tcount  = actions.tuple_length();
+    throw_if(code, actions.null?());
+    int mode    = 64;
+    int msg_idx = 0;
+    if ( (exp_op == op::response::proposal_accepted) & (tcount == 2)) {
+        mode     = 128;
+        msg_idx += 1;
+        tuple reserve = actions.first();
+        ;; Action type is reserve
+        throw_unless(code + 2, reserve.at(0) == 2);
+        ;; Reserve type is 4
+        throw_unless(code + 3, reserve.at(2) == 4);
+        int res_amount = reserve.at(1).at(0);
+        throw_unless(code + 4, res_amount == price);
+
+    }
+    else {
+        throw_unless(code + 5, actions.tuple_length() == 1);
+    }
+
+    return actions.at(msg_idx).assert_response_msg_from(code + 10, src, exp_op, mode, query_id, false, 0);
+}
+
+_ assert_code_upgrade(int code, cell code_cell) impure inline {
+    tuple actions = parse_c5();
+
+    throw_if(code, actions.null?());
+    throw_unless(code + 1, actions.tuple_length() == 1);
+
+    tuple code_action = actions.first();
+    throw_unless(code + 2, code_action.first() == 1);
+    throw_unless(code + 3, code_cell.cell_hash() == code_action.second().cell_hash());
+    throw_unless(code + 4, code_action.third() == -1);
+}
+
+tuple assert_elector_update_from(tuple msg, int code, cell cell_code, slice elector) impure inline {
+    tuple res = msg.assert_response_msg_from(code, elector, op::set_new_code, 0, now(), true, 1 << 30);
+    throw_unless(code + 20, cell_code.cell_hash() == res.at(8).preload_ref().cell_hash());
+    return res;
+}
+
+cell validators_set(int valid_since, int valid_till, int total_count, int total_main, int total_weight, cell desc) {
+    return begin_cell().store_uint(0x12,8)
+                        .store_uint(valid_since,32)
+                        .store_uint(valid_till, 32)
+                        .store_uint(total_count,16)
+                        .store_uint(total_main, 16)
+                        .store_uint(total_weight, 64)
+                        .store_dict(desc)
+                       .end_cell();
+}
+
+(int, int, int) get_validators_numbers() {
+    slice vn = config_param(config_params::validators_numbers).begin_parse();
+    return (vn~load_uint(16), vn~load_uint(16), vn~load_uint(16));
+}
+
+int get_min_validators() {
+    ( _, _, int min ) = get_validators_numbers();
+    return min;
+}
+
+(int, int, int, int) get_validation_times() impure inline {
+    slice vt = config_param(config_params::validation_times).begin_parse();
+    return (vt~load_int(32), ;; elected_for
+            vt~load_int(32), ;; start_before
+            vt~load_int(32), ;; end_before
+            vt~load_int(32)); ;; held_for
+}
+
+cell new_vset(int count, int weight, cell desc) impure inline {
+    ;; Creates new valid validators set with description cell specified.
+    (int elect_for, int start_beofre, int end_before, _) = get_validation_times();
+    (int max_vldtrs, int max_main, int min_vldtrs)       = get_validators_numbers();
+
+    int start = now() + end_before - 60;
+
+    ifnot( count ) {
+        count = rand(max_vldtrs - min_vldtrs) + min_vldtrs + 1;
+    }
+
+    return validators_set(start, start + elect_for, count, min(max_main, count), weight, desc);
+}
+
+
+
+(int, int, int, int, int, cell) parse_vset (cell vcell) impure inline {
+   slice vs = vcell.begin_parse();
+   int flag = vs~load_uint(8);
+   return (vs~load_uint(32), ;; start
+           vs~load_uint(32), ;; stop
+           vs~load_uint(16), ;; total validators
+           vs~load_uint(16), ;; total main validators
+           vs~load_uint(64), ;; total weight
+           vs~load_dict()); ;; validators descr
+}
+
+cell update_vdesc(cell vset, cell vdesc) {
+    ;; Could have skip_bits
+    var (start, stop, total_v, total_m, tw, _) = vset.parse_vset();
+
+    return validators_set(start, stop, total_v, total_m, tw, vdesc);
+}
+
+(int, int, int) parse_vdesc (slice vs) impure inline {
+
+    int flag      = vs~load_uint(8);
+    int has_adnl? = ( flag == 0x73 );
+    int adnl      = 0;
+
+    int tag  = vs~load_uint(32);
+
+    int pub  =  vs~load_uint(256);
+    int wt   =  vs~load_uint(64);
+
+    if ( has_adnl? ) {
+        adnl = vs~load_uint(256);
+    }
+
+    return (pub, wt, adnl);
+
+}
+
+cell load_vdesc(cell vcell) inline {
+
+    (_, _, _, _, _, cell vdesc) = vcell.parse_vset();
+
+    return vdesc;
+}
+
+slice save_vdesc(int pub, int weight, int adnl) {
+    int v_type = adnl == 0 ? 0x53 : 0x73;
+
+    builder desc = begin_cell().store_uint(v_type, 8)
+                               .store_uint(tag::ed25519_pubkey, 32)
+                               .store_uint(pub, 256)
+                               .store_uint(weight, 64);
+    if ( adnl != 0 ) {
+        desc = desc.store_uint(adnl, 256);
+    }
+
+    return desc.end_cell().begin_parse();
+}
+
+
+
+
+
+forall X -> (int, int, X) random_elem_ref(cell dict, int key_size, int is_int?, int is_ref?) impure inline_ref {
+
+    ;; Slower than previous implementation, but provides true distribution
+
+    key_size   = min(256, key_size);
+
+    if ( dict.dict_empty?() ) {
+        return (-1, null(), null());
+    }
+
+    tuple keys = nil;
+    int count  = 0;
+
+    do {
+        var (idx, val, f) = is_int? ? dict~idict::delete_get_min(key_size) : dict~udict::delete_get_min(key_size);
+
+        if ( f ) {
+            if ( is_ref? ) {
+                keys   = cons(pair(idx, val.preload_ref()), keys);
+            }
+            else {
+                keys   = cons( pair(idx, val), keys);
+            }
+            count += 1;
+        }
+
+    } until ( ~ f );
+
+    int total = rand( count ) + 1;
+
+    tuple res = nil;
+
+    repeat( total ) {
+        res = keys~list_next();
+    }
+
+    return ( true, res.first(), res.second() );
+}
+
+
+(int, int, slice) random_elem(cell dict, int key_size, int is_int?) impure inline {
+    return random_elem_ref(dict, key_size, is_int?, false);
+}
+
+(int,int) generate_keypair() impure inline {
+    int priv = random();
+
+    return (priv, priv.priv_to_pub());
+}
+
+(cell, (int, int)) generate_keypair_not_in(cell kdict) impure inline {
+    ;; Expression of distrust in randomness
+
+    int status? = false;
+    int priv    = 0;
+    int pub     = 0;
+
+    do {
+        (priv, pub)  = generate_keypair();
+        (_, status?) = kdict.udict_get?(256, pub);
+    } until( ~ status? );
+
+    kdict~udict_set_builder(256, pub, begin_cell().store_uint(priv, 256));
+
+    return (kdict, (priv, pub));
+}
+
+int pick_key(cell keys, int pub) {
+    var (ks, f?) = keys.udict_get?(256, pub);
+
+    if ( f? ) {
+       return ks.preload_uint(256);
+    }
+    else {
+        return false;
+    }
+}
+
+(cell, (int, int) ) pick_random_key(cell keys, int remove?) {
+    var (f?, pub, ks) = keys.random_elem(256, false);
+
+    if ( f? ) {
+        int priv = ks.preload_uint(256);
+
+        if ( remove? ) {
+            keys~udict_delete?(256, pub);
+        }
+
+        return (keys, (priv, pub));
+    }
+    else {
+        return (keys, (null(), null()));
+    }
+}
+
+(cell, cell) generate_validators_keys(cell vdesc) {
+    ;; Idea is that we re-pack existing vset with our keys
+
+    cell new_keys  = new_dict();
+    cell new_vdesc = new_dict();
+
+    do {
+        var (priv, pub)    = new_keys~generate_keypair_not_in();
+        var (idx, val, f?) = vdesc~udict::delete_get_min(16);
+
+        if ( f? ) {
+            var (_, wt, adnl) = val.parse_vdesc();
+            slice desc_upd    = save_vdesc(pub, wt, adnl);
+            new_vdesc~udict_set(16, idx, desc_upd);
+        }
+
+    } until( ~ f? );
+
+    return (new_vdesc, new_keys);
+}
+
+cell set_new_validators_keys() impure inline {
+
+    ;; Replace validators keys with new set and but back to config
+    cell config = get_config();
+    cell vset = config_param(config_params::current_validators_set);
+
+    ;; We need to swap validators keys to vote
+    var (start, stop, total, main, tw, descr) = vset.parse_vset();
+    cell new_keys = descr~generate_validators_keys();
+    ;; Pack vset back
+    vset = validators_set(start, stop, total, main, tw, descr);
+
+    config~idict_set_ref(32, config_params::current_validators_set, vset);
+    config.set_global_config();
+    config.set_contract_config();
+
+    return new_keys;
+}
+
+int generate_different(int old, int bits, int max_val) impure inline {
+    int below_256? = ( bits < 256 );
+
+    if ( below_256? ) {
+        ;; max_val only for values < 256 bit
+        max_val     = max_val == 0 ? (1 << bits)  : min(max_val, (1 << bits));
+    }
+
+    int new_val = 0;
+
+    do {
+        new_val = below_256? ? rand(max_val) : random();
+    } until( new_val != old );
+
+    return new_val;
+}
+
+(int, tuple) find_by_id(tuple t, int id) impure inline {
+    ;; Generic proc for searcing [id, whatever,...,] elements lisp-list
+    int found? = false;
+    tuple el   = empty_tuple();
+
+    if ( ~ t.null?() ){
+        do {
+            el     = t~list_next();
+            found? = ( id == el.first() );
+        } until( found? | t.null?() );
+    }
+
+    return (found?, el);
+}
+
+int find_voter(tuple t, int elem) {
+    int found? = false;
+    while( ~ t.null?() ) {
+        if ( elem == t~list_next() ) {
+            return true;
+        }
+    }
+
+    return found?;
+}
+
+;; cfg_proposal#f3 param_id:int32 param_value:(Maybe ^Cell) if_hash_equal:(Maybe uint256)
+;; c -> (param-id param-cell maybe-hash)
+cell generate_cfg_proposal(int param_id, cell param_value, int cell_hash) {
+    builder prop = begin_cell().store_uint(0xf3, 8).store_int(param_id, 32);
+    if ( param_value.null?() ) {
+        ;; Both maybe bits 0
+        prop = prop.store_uint(0, 2);
+    }
+    else {
+        prop = prop.store_uint(1, 1).store_ref(param_value);
+        if ( cell_hash >= 0 ) {
+            prop = prop.store_uint(1, 1).store_uint(cell_hash, 256);
+        }
+        else {
+            prop = prop.store_uint(0, 1);
+        }
+    }
+
+    return prop.end_cell();
+}
+
+cell get_test_vote_config_int(int critical?) inline {
+    slice cs = config_param(config_params::voting_setup).begin_parse();
+    if ( critical? ) {
+        cs~load_ref();
+    }
+
+    return cs.preload_ref();
+}
+
+int is_critical?(int idx) inline {
+    cell crit_params   = config_param(config_params::critical_params);
+    (_, int critical?) = crit_params.idict_get?(32, idx);
+
+    return critical?;
+}
+
+(int, int) get_prop_storage_price(cell prop, int expire_in, int critical?) {
+    (_, int bits, int refs) = prop.compute_data_size(1024);
+
+    var (gas, stack) = invoke_method(proposal_storage_price, [critical?, expire_in, bits, refs]);
+
+    return (gas, stack.first());
+}
+
+;; (min_tot_rounds, max_tot_rounds, min_wins, max_losses, min_store_sec, max_store_sec, bit_price, cell_price)
+(int, int, int, int, int, int, int, int)  parse_test_vote_config(cell c) inline {
+  var cs = c.begin_parse().skip_bits(8);
+  var res = (cs~load_uint(8), cs~load_uint(8), cs~load_uint(8), cs~load_uint(8), cs~load_uint(32), cs~load_uint(32), cs~load_uint(32), cs~load_uint(32));
+  return res;
+}
+
+(int, int, int, int, int, int, int, int) get_test_vote_config(int critical?) inline {
+    cell vc = get_test_vote_config_int(critical?);
+    return vc.parse_test_vote_config();
+}
+
+(int, int) get_vote_store_sec(int critical?) inline {
+    (_, _, _, _, int min_store, int max_store, _, _) =  get_test_vote_config(critical?);
+
+    return (min_store, max_store);
+}
+
+(int, int) get_vote_wl(int critical?) inline {
+
+    (_, _, int min_wins, int max_losses, _, _, _, _) =  get_test_vote_config(critical?);
+
+    return  (min_wins, max_losses);
+}
+
+(int, int) get_vote_rounds(int critical?) inline {
+    (int min_rounds, int max_rounds, _, _, _, _, _, _) = get_test_vote_config(critical?);
+
+    return (min_rounds, max_rounds);
+}
+
+int get_random_store_time(int critical?) {
+    (int min_store, int max_store) = get_vote_store_sec(critical?);
+
+    return rand(max_store - min_store) + min_store + 1;
+}
+
+int tick_tock() impure inline_ref {
+
+    int gas  = 0;
+    (gas, _) = invoke_method(run_ticktock, [ true ]);
+
+    return gas;
+}
+
+cell next_round () impure inline_ref {
+    {-
+      Idea is that we generate new vset with same vdesc
+      and setting it as current in config
+    -}
+
+    cell vset   = config_param(config_params::current_validators_set);
+    cell config = get_config();
+    var (_, _, count, _, weight, vdesc) = vset.parse_vset();
+    ;; Wait a sec just for start stop vset fields to change
+    wait_till(now() + 1);
+    cell new_set = new_vset(count, weight, vdesc);
+
+    config~idict_set_ref(32, config_params::current_validators_set, new_set);
+    set_global_config(config);
+
+    return new_set;
+}
+
+
+builder generate_next_vset_msg(cell vset, int query_id) impure inline {
+    return generate_internal_message_body(op::set_next_validator_set, query_id).store_ref(vset);
+}
+
+builder generate_proposal_msg(cell proposal, int expire_in, int critical?, int query_id) impure inline {
+    return generate_internal_message_body(op::new_voting_proposal, query_id).store_uint(expire_in, 32)
+                                                                            .store_int(critical?, 1)
+                                                                            .store_ref(proposal);
+}
+
+builder generate_custom_vote_msg(int query_id, int tag, int idx, int phash, int priv) impure inline {
+    slice body =   begin_cell().store_uint(tag, 32)
+                               .store_uint(idx, 16)
+                               .store_uint(phash, 256)
+                   .end_cell().begin_parse();
+    slice signature = body.sign_data(priv);
+
+    return generate_internal_message_body(op::vote_for_config_proposal, query_id).store_slice(signature)
+                                                                                 .store_slice(body);
+}
+
+builder generate_vote_msg(int query_id, int idx, int phash, int priv) impure inline {
+    return generate_custom_vote_msg(query_id, tag::signature_challenge, idx, phash, priv);
+}
+
+slice generate_external_msg(int op, int seqno, int valid_untill, int priv, builder body, int sign_data?) {
+
+   slice body_int = begin_cell().store_uint(op, 32)
+                                .store_uint(seqno, 32)
+                                .store_uint(valid_untill, 32)
+                                .store_builder(body)
+                    .end_cell().begin_parse();
+   ;; Message body hash is signed for some ops
+   slice signature = sign_data? ? body_int.sign_data(priv) : body_int.slice_hash().sign(priv);
+
+   return begin_cell().store_slice(signature).store_slice(body_int).end_cell().begin_parse();
+}
+
+builder generate_vote_msg_external(int idx, int phash) inline {
+    return begin_cell().store_uint(idx, 16).store_uint(phash, 256);
+}
+
+int comp_int_tuple(tuple a, int code, tuple b, int start_idx, int cmp_len) impure inline {
+    repeat(cmp_len) {
+        throw_unless(code + start_idx, a.at(start_idx) == b.at(start_idx));
+        start_idx += 1;
+    }
+
+    return true;
+}
+
+int comp_int_list(tuple a, int code, tuple b) impure inline {
+
+    while( ~ (a.null?() | b.null?()) ) {
+        throw_unless(code, a~list_next() == b~list_next());
+    }
+
+    ;; Both have to be empty, otherwise different length
+    throw_unless(code, a.null?() & b.null?());
+
+    return true;
+}
+
+_ assert_proposal_val(tuple prop, int code, int expire_in,
+                      int critical?, int idx, cell new_val,
+                      int param_hash, cell vset, tuple voters,
+                      int win_count,  int loss_count) impure inline {
+
+    throw_unless(code + 1, now() + expire_in == prop.at(0));
+    throw_unless(code + 2, critical? == prop.at(1));
+
+    ;; Parameter related values tuple
+    tuple param = prop.at(2);
+    throw_unless(code + 3, idx == param.at(0));
+    throw_unless(code + 4, new_val.cell_hash() == param.at(1).cell_hash());
+    throw_unless(code + 5, param_hash == param.at(2));
+
+    int vset_id = vset.cell_hash();
+    throw_unless(code + 6, vset_id  == prop.at(3));
+
+    if ( voters.null?() ) {
+        ;; No voters yet
+        throw_unless(code + 20, prop.at(4).null?());
+    }
+    else {
+        tuple r_voters = prop.at(4);
+        r_voters.comp_int_list(code + 7, voters);
+    }
+
+    (_,_,_,_, int total_weight, _) = vset.parse_vset();
+    int weight_left = muldiv(total_weight, 3, 4);
+    throw_unless(code + 8, weight_left == prop.at(5));
+
+    (_, int max_rounds,
+     _, _, _, _, _, _) = get_test_vote_config(critical?);
+
+    throw_unless(code + 9, max_rounds == prop.at(6));
+    ;; Losses and wins are switched in older config
+    throw_unless(code + 10, prop.at(8) == win_count);
+    throw_unless(code + 11, prop.at(7) == loss_count);
+}
+
+_ assert_proposal_cmp_tuple(tuple prop, int code, tuple comp ) impure inline {
+    {-
+      Definitely should implement generic tuple comp instead.
+    -}
+    throw_unless(code, comp.at(0) == prop.at(0));
+    throw_unless(code + 1, comp.at(1) == prop.at(1));
+
+    tuple conf_p = prop.at(2);
+    tuple conf_c = comp.at(2);
+    throw_unless(code, conf_p.at(0) == conf_c.at(0));
+    throw_unless(code + 2, conf_p.at(1).cell_hash() == conf_c.at(1).cell_hash());
+    throw_unless(code + 3, conf_p.at(2) == conf_c.at(2));
+
+    tuple voters = comp.at(4);
+    voters.comp_int_list(code + 1, prop.at(4));
+    throw_unless(code + 4, comp.at(3) == prop.at(3));
+    prop.comp_int_tuple(code + 60, comp, 5, 3);
+}
+
+tuple assert_proposal_vote(int code, slice src_addr, int exp_status, query_id) impure inline_ref {
+    return assert_response_msg(code, src_addr, op::response::vote_result + exp_status, 64, query_id, false, false);
+}
+
+tuple assert_proposal_vote_from(tuple msg, int code, slice src_addr, int exp_status, query_id) impure inline {
+    return msg.assert_response_msg_from(code, src_addr, op::response::vote_result + exp_status, 64, query_id, false, false);
+}
+
+int assert_proposal_removed(int code, int phash) impure inline {
+    var (gas_gp, stack) = invoke_method(get_proposal, [phash]);
+    throw_unless(code, stack.first().null?());
+    var (gas_plist, stack) = invoke_method(list_proposals, []);
+    var (f?, _) = stack.first().find_by_id(phash);
+    throw_if(code + 1, f?);
+
+    return gas_gp + gas_plist;
+}
+
+_  assert_proposal_change(tuple prop, int code, int voter_id, int exp_weight) impure inline_ref {
+        ;; Checking expected weight left value
+        throw_unless(code, exp_weight == prop.at(5));
+        tuple voters = prop.at(4);
+        ;; Checking if voter present in voters list
+        int found?   = voters.find_voter(voter_id);
+        throw_unless(code + 1, found?);
+}
+
+(int, int, int) submit_valid_proposal(int code, int idx, cell new_val, int not_null?) {
+
+    cell param_val = null();
+
+    if ( idx.null?() ) {
+        (_, idx, param_val) = get_config().random_elem_ref(32, true, true);
+    }
+    else {
+        param_val           = config_param(idx);
+    }
+
+
+    int query_id   = rand(12345) + 1;
+    int exp_code   = op::response::proposal_accepted;
+    int critical?  = is_critical?(idx);
+    int expire_in  = get_random_store_time(critical?);
+    int param_hash = param_val.null?() ? -1 : param_val.cell_hash();
+
+    if ( new_val.null?() & not_null? ) {
+        new_val   = begin_cell().store_uint(random(), 256).end_cell();
+    }
+
+    slice src_addr = generate_internal_address();
+
+    var (gas_st, int ton_amount) = new_val.get_prop_storage_price(expire_in, critical?);
+
+    cell prop       = generate_cfg_proposal(idx, new_val, param_hash);
+    var  prop_body  = prop.generate_proposal_msg(expire_in, critical?, query_id);
+
+    cell msg        = generate_internal_message_custom(0, ton_amount, 0, prop_body,
+                                                       src_addr, null(), 0);
+
+    (int gas_msg, _) = invoke_method(recv_internal, [ton_amount + proposal_fee, msg,
+                                                     prop_body.end_cell().begin_parse()]);
+
+
+    assert_new_proposal(code, src_addr, exp_code, query_id, ton_amount);
+
+    return (gas_msg + gas_st, prop.cell_hash(), critical?);
+}
+
+int rand_gl() impure inline_ref {
+    int gl     = get_gl();
+    int rnd_gl = gl - (rand(gl / 10) + 1);
+    set_gas_limit(rnd_gl);
+    return rnd_gl;
+}
+

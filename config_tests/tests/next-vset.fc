@@ -1,0 +1,121 @@
+#include "constants.fc";
+#include "helpers.fc";
+#include "test-wraps.fc";
+
+int __test_next_vset_not_elector() {
+
+    default_config();
+    default_address();
+
+    int query_id  = rand(12345) + 1;
+    ;; New validator set
+    cell vset     = new_vset(0, 0, null());
+
+    int gas_fail  = test_vset_update(false, 300, my_address(), query_id, vset);
+
+    ;; Expect vset reject message
+    assert_update_vset(false, 300, my_address(), query_id);
+
+    slice elector = get_elector_address();
+    ;; Trying with elector address
+
+    ;; Expect success
+    int gas_success = test_vset_update(true, 400, elector, query_id, vset);
+
+    return gas_fail + gas_success;
+}
+
+int __test_next_vset_already_current() {
+
+    ;; valid_since should be > now() otherwise it's current vset and not next.
+    default_config();
+
+    slice elector = get_elector_address();
+
+    int query_id  = rand(12345) + 1;
+
+
+    (int elect_for, int start_beofre, int end_before, _) = get_validation_times();
+    (int max_vldtrs, int max_main, int min_vldtrs)       = get_validators_numbers();
+
+    int valid_since = now();
+    int v_count     = rand(max_vldtrs - min_vldtrs) + min_vldtrs + 1;
+    cell desc       = begin_cell().end_cell();
+    cell vset       = validators_set(valid_since, valid_since + elect_for,
+                                     v_count, min(v_count, max_main), 0, desc);
+
+    builder body    = vset.generate_next_vset_msg(query_id);
+
+    int gas_fail    = test_vset_update(false, 300, elector, query_id, vset);
+
+    valid_since     = now() + rand(1000) + 1;
+    vset            = validators_set(valid_since, valid_since + elect_for,
+                                        v_count, min(v_count, max_main), 0, desc);
+
+    int gas_success = test_vset_update(true, 400, elector, query_id, vset);
+
+    return gas_fail + gas_success;
+}
+
+int __test_next_vset_already_expired() {
+
+    ;; valid_till should be > valid_since
+    default_config();
+
+    slice elector = get_elector_address();
+
+    int query_id  = rand(12345) + 1;
+
+
+    (int elect_for, int start_beofre, int end_before, _) = get_validation_times();
+    (int max_vldtrs, int max_main, int min_vldtrs)       = get_validators_numbers();
+
+    int valid_since = now() + rand(1000) + 1;
+    int v_count     = rand(max_vldtrs - min_vldtrs) + min_vldtrs + 1;
+    cell desc       = begin_cell().end_cell();
+    ;; Now it's - elect_for
+    cell vset       = validators_set(valid_since, valid_since - elect_for,
+                                     v_count, min(v_count, max_main), 0, desc);
+
+    int gas_fail    = test_vset_update(false, 300, elector, query_id, vset);
+
+    vset            = validators_set(valid_since, valid_since + elect_for,
+                                        v_count, min(v_count, max_main), 0, desc);
+
+    int gas_success = test_vset_update(true, 400, elector, query_id, vset);
+
+    return gas_fail + gas_success;
+}
+
+int __test_next_vset_confirmed() {
+    ;; Success case
+
+    default_config();
+
+    slice elector = get_elector_address();
+
+    int query_id  = rand(12345) + 1;
+
+    ;; New currently valid vset
+    cell new_vset = new_vset(0, 0, null());
+
+    cell next_vset = config_param(config_params::next_validators_set);
+
+    ;; Might be null
+    if ( ~ next_vset.null?() ) {
+        ;; Checking that it's not equal to default one
+        throw_if(300, next_vset.cell_hash() == new_vset.cell_hash());
+    }
+
+    int gas_success = test_vset_update(true, 400, elector, query_id, new_vset);
+
+    ;; Now updateing config
+    update_config();
+
+    next_vset = config_param(config_params::next_validators_set);
+
+    ;; Expect next vset to become equal to new vset specified
+    throw_unless(450, next_vset.cell_hash() == new_vset.cell_hash());
+
+    return gas_success;
+}

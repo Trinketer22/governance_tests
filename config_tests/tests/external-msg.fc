@@ -1,0 +1,182 @@
+#include "constants.fc";
+#include "helpers.fc";
+#include "test-wraps.fc";
+
+int __test_ext_expired() {
+
+    default_config();
+    cell keys   = set_new_validators_keys();
+
+    int op      = rand(100);
+    int seqno   = 0;
+    int expired = now() - (rand(1000) + 1);
+    int gas_fail_mc = test_external_accepted(300, op,
+                                             0, expired, config_masterkey,
+                                             null(), error::external_msg::expired);
+
+    int gas_success_mc = test_external_accepted(400, op,
+                                                0, now(), config_masterkey,
+                                                null(), false);
+    seqno += 1;
+    ;; Checking that both branches behave the same way
+
+    var (gas_prop, phash, _) = submit_valid_proposal(500, null(), null(), true);
+
+    int gas_fail_vote        = keys.test_external_accepted_vote(500, seqno,
+                                                                expired, phash,
+                                                                error::external_msg::expired);
+
+    int gas_success_vote     = keys.test_external_accepted_vote(600, seqno,
+                                                                now(), phash,
+                                                                false);
+    return gas_fail_mc + gas_success_mc + gas_prop + gas_fail_vote + gas_success_vote;
+}
+
+int __test_ext_too_deep() {
+
+    default_config();
+
+    int op      = rand(100);
+    int seqno   = 0;
+
+    cell keys   = set_new_validators_keys();
+    cell vdesc  = config_param(config_params::current_validators_set).load_vdesc();
+
+    var (_, idx, desc)       = vdesc.random_elem(16, false);
+    var (gas_prop, phash, _) = submit_valid_proposal(300, null(), null(), true);
+
+    (int pub, _, _)   = desc.parse_vdesc();
+    int priv          = keys.pick_key(pub);
+
+    builder body      = generate_vote_msg_external(idx, phash);
+    cell    deep_c    = body.end_cell();
+    cell    shallow_c = deep_c;
+
+    repeat(128) {
+        cell new_cell = begin_cell().store_ref(deep_c).end_cell();
+        deep_c        = new_cell;
+    }
+
+    ;; Resulting depth is iteration + 1;
+
+    builder deep = body.store_ref(deep_c);
+
+    repeat(rand(127) + 1) {
+        cell new_cell = begin_cell().store_ref(shallow_c).end_cell();
+        shallow_c     = new_cell;
+    }
+
+    builder shallow   = body.store_ref(shallow_c);
+
+    int gas_fail_mc   = test_external_accepted(400, op,
+                                                seqno, now(), config_masterkey,
+                                                deep, error::external_msg::too_deep);
+
+    int gas_success_mc = test_external_accepted(500, op,
+                                                seqno, now(), config_masterkey,
+                                                shallow, false);
+    seqno += 1;
+
+    ;; Testing with vote op
+    op = op::vote_for_config_proposal;
+
+    int gas_fail_vote = test_external_accepted(600, op,
+                                               seqno, now(), priv,
+                                               deep, error::external_msg::too_deep);
+
+    ;; If we're using vote op we can't have any extra data/ref in msg
+    int gas_success_vote = test_external_accepted(700, op,
+                                                  seqno, now(), priv,
+                                                  body, false);
+
+
+    return gas_fail_mc + gas_success_mc + gas_prop + gas_fail_vote + gas_success_vote;
+}
+
+int __test_ext_bad_signature() {
+
+    default_config();
+
+    int op      = rand(100);
+    int seqno   = 0;
+
+    int bad_master = config_masterkey.generate_different(256, false);
+
+    cell keys   = set_new_validators_keys();
+    cell vdesc  = config_param(config_params::current_validators_set).load_vdesc();
+
+    var (_, idx, desc)       = vdesc.random_elem(16, false);
+    var (gas_prop, phash, _) = submit_valid_proposal(300, null(), null(), true);
+
+    (int pub, _, _)   = desc.parse_vdesc();
+    int priv          = keys.pick_key(pub);
+    int bad_priv      = priv.generate_different(256, false);
+
+
+    int gas_fail_mc    = test_external_accepted(400, op,
+                                                seqno, now(), bad_master,
+                                                null(), error::external_msg::sig_mismatch);
+    int gas_success_mc = test_external_accepted(500, op,
+                                                seqno, now(), config_masterkey,
+                                                null(), false);
+
+    seqno             += 1;
+
+    builder body       = generate_vote_msg_external(idx, phash);
+    op                 = op::vote_for_config_proposal;
+
+    int gas_fail_vote  = test_external_accepted(600, op,
+                                                seqno, now(), bad_priv,
+                                                body, error::external_msg::sig_mismatch);
+
+    int gas_success_vote = test_external_accepted(600, op,
+                                                  seqno, now(), priv,
+                                                  body, false);
+
+    return gas_fail_mc + gas_success_mc + gas_prop + gas_fail_vote + gas_success_vote ;
+}
+
+int __test_ext_track_seqno() {
+
+    default_config();
+    cell keys  = set_new_validators_keys();
+
+    int op               = rand(100);
+    int seqno            = 0;
+    int seq_try          = rand(10 - 1) + 2;
+    int gas_success_mc   = 0;
+    int gas_success_vote = 0;
+
+    repeat(seq_try) {
+        int gas_try = test_external_accepted(300, op,
+                                             seqno, now(), config_masterkey,
+                                             null(), false);
+        seqno          += 1;
+        gas_success_mc += gas_try;
+    }
+
+    int bad_seqno   = seqno.generate_different(32, false);
+
+    int gas_fail_mc = test_external_accepted(400, op,
+                                             bad_seqno, now(), config_masterkey,
+                                             null(), error::external_msg::seqno_mismatch);
+
+
+    var (gas_prop, phash, _) = submit_valid_proposal(500, null(), null(), true);
+
+    repeat(seq_try) {
+        int gas_try = keys.test_external_accepted_vote(600, seqno,
+                                                       now(), phash, false);
+        seqno            += 1;
+        gas_success_vote += gas_try;
+    }
+
+    bad_seqno         = seqno.generate_different(32, false);
+
+    int gas_fail_vote = keys.test_external_accepted_vote(700, bad_seqno,
+                                                         now(), phash,
+                                                         error::external_msg::seqno_mismatch);
+
+
+    return gas_success_mc + gas_fail_mc + gas_prop + gas_success_vote + gas_fail_vote;
+}

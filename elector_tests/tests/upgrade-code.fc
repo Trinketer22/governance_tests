@@ -1,0 +1,98 @@
+int __test_upgrade_code_no_config() {
+    default_address();
+    default_config();
+
+    cell config_prev  = config_param(config_params::config_address);
+    int  config_addr  = config_prev.begin_parse().preload_uint(256);
+
+    slice src_addr    = generate_internal_address_with_custom_data(0,-1,config_addr);
+    int query_id      = rand(12345) + 1;
+    unset_config_param(config_params::config_address);
+
+    builder msg_body  = generate_updgrade_code_msg(query_id, begin_cell().end_cell());
+    slice   bd_slice  = msg_body.end_cell().begin_parse();
+    cell    msg       = generate_internal_message_custom(0, 0, 0,
+                                                        msg_body, src_addr,
+                                                        null(), 0);
+    (int gas_fail, _) = invoke_method(recv_internal, [0, msg, bd_slice]);
+
+    assert_upgrade_not_allowed(300, src_addr, query_id);
+    ;; Now change config address back
+    set_config_param(config_params::config_address, config_prev);
+
+    (int gas_success, _) = invoke_method(recv_internal, [0, msg, bd_slice]);
+
+    assert_upgrade_successfull(400, src_addr, query_id);
+
+    return gas_fail + gas_success;
+}
+
+int __test_upgrade_code_not_mc() {
+
+    default_address();
+    default_config();
+
+    int config_addr    = config_param(config_params::config_address).begin_parse()
+                                                                    .preload_uint(256);
+
+    slice valid_addr   = generate_internal_address_with_custom_data(0, -1,config_addr);
+    ;; Invalid addr differs only in worchain
+    slice invalid_addr = generate_internal_address_with_custom_data(0, 0, config_addr);
+    int query_id       = rand(12345) + 1;
+
+    builder msg_body  = generate_updgrade_code_msg(query_id, begin_cell().end_cell());
+    slice   bd_slice  = msg_body.end_cell().begin_parse();
+    cell    msg       = generate_internal_message_custom(0, 0, 0,
+                                                        msg_body, invalid_addr,
+                                                        null(), 0);
+
+    (int gas_fail, _) = invoke_method(recv_internal, [0, msg, bd_slice]);
+
+    assert_upgrade_not_allowed(300, invalid_addr, query_id);
+
+    ;; Now trying valid address
+    msg               = generate_internal_message_custom(0, 0, 0,
+                                                        msg_body, valid_addr,
+                                                        null(), 0);
+
+    (int gas_success, _) = invoke_method(recv_internal, [0, msg, bd_slice]);
+
+    ;; Should succeed
+    assert_upgrade_successfull(400, valid_addr, query_id);
+    return gas_fail + gas_success;
+
+}
+
+int __test_upgrade_code_not_config() {
+    default_address();
+    default_config();
+
+    int config_addr    = config_param(config_params::config_address).begin_parse()
+                                                                    .preload_uint(256);
+
+    slice valid_addr   = generate_internal_address_with_custom_data(0, -1,config_addr);
+    slice invalid_addr = generate_different_address(-1, valid_addr);
+    int query_id       = rand(12345) + 1;
+
+    builder msg_body  = generate_updgrade_code_msg(query_id, begin_cell().end_cell());
+    slice   bd_slice  = msg_body.end_cell().begin_parse();
+    cell    msg       = generate_internal_message_custom(0, 0, 0,
+                                                        msg_body, invalid_addr,
+                                                        null(), 0);
+
+    (int gas_fail, _) = invoke_method(recv_internal, [0, msg, bd_slice]);
+
+    assert_upgrade_not_allowed(300, invalid_addr, query_id);
+
+    ;; Now trying valid address
+    msg               = generate_internal_message_custom(0, 0, 0,
+                                                        msg_body, valid_addr,
+                                                        null(), 0);
+
+    (int gas_success, _) = invoke_method(recv_internal, [0, msg, bd_slice]);
+
+    ;; Should succeed
+    assert_upgrade_successfull(400, valid_addr, query_id);
+    return gas_fail + gas_success;
+
+}

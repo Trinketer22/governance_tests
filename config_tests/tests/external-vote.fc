@@ -1,0 +1,839 @@
+#include "constants.fc";
+#include "helpers.fc";
+#include "test-wraps.fc";
+
+{-
+  Same cases as for internal vote, but via external messages.
+  Idea is to proove that logic works the same way in both cases.
+  Heavily based on vote-internal.fc
+-}
+
+int __test_ext_vote_bad_signature() {
+
+    default_config();
+
+
+    ;; Setting keys so we can vote
+    cell keys = set_new_validators_keys();
+
+    var (gas_prop, phash, critical?) = submit_valid_proposal(300, null(), null(), true);
+
+    cell vset = config_param(config_params::current_validators_set);
+    var (_, _, _, _, total_weight, vdesc) = vset.parse_vset();
+
+    var (_, idx, desc) = vdesc.random_elem(16, false);
+
+    var (pub, weight, _)   = desc.parse_vdesc();
+
+    int priv          = keys.pick_key(pub);
+    int bad_priv      = priv.generate_different(256, false);
+    int exp_code      = error::proposal_vote::sig_mismatch;
+    int seqno         = 0;
+    int weight_exp    = muldiv(total_weight, 3, 4) - weight;
+
+    slice src_addr    = generate_internal_address();
+
+    int gas_fail      = test_prop_vote_ext(400, idx, phash,
+                                           seqno, weight_exp, bad_priv,
+                                           exp_code, false);
+
+    ;; Now with valid private key
+
+    int gas_success   = test_prop_vote_ext(500, idx, phash,
+                                           seqno, weight_exp, priv,
+                                           false, true);
+
+    return gas_prop + gas_fail + gas_success;
+}
+
+int __test_ext_vote_wrong_proposal() {
+
+    default_config();
+
+
+    ;; Setting keys so we can vote
+    cell keys = set_new_validators_keys();
+
+    var (gas_prop, phash, critical?) = submit_valid_proposal(300, null(), null(), true);
+
+    cell vset = config_param(config_params::current_validators_set);
+    var (_, _, _, _, total_weight, vdesc) = vset.parse_vset();
+
+    var (_, idx, desc) = vdesc.random_elem(16, false);
+
+    var (pub, wt, _)   = desc.parse_vdesc();
+
+    int priv           = keys.pick_key(pub);
+    ;; Different proposal hash
+    int bad_phash      = phash.generate_different(256, false);
+    int weight_left    = muldiv(total_weight, 3, 4);
+    int seqno          = 0;
+
+    int gas_fail       = test_prop_vote_ext(400, idx, bad_phash,
+                                            seqno, weight_left, priv,
+                                            false, false);
+
+    int gas_success    = test_prop_vote_ext(500, idx, phash,
+                                           seqno + 1, weight_left - wt, priv,
+                                           false, true);
+
+    return gas_prop + gas_fail + gas_success;
+}
+
+int __test_ext_vote_proposal_expired() {
+
+    default_config();
+
+    ;; Setting keys so we can vote
+    cell keys = set_new_validators_keys();
+
+    var (gas_prop, phash, critical?) = submit_valid_proposal(300, null(), null(), true);
+
+    cell vset = config_param(config_params::current_validators_set);
+    var (_, _, _, _, total_weight, vdesc) = vset.parse_vset();
+
+    var (_, idx, desc) = vdesc.random_elem(16, false);
+    var (pub, wt, _)   = desc.parse_vdesc();
+
+    int weight_left    = muldiv(total_weight, 3, 4);
+    int priv           = keys.pick_key(pub);
+    int seqno          = 0;
+
+    {-
+      Let's vote first to prove that all is well and good with current proposal.
+      And then wait till expire and vote again to see that it's not votable anymore.
+      So kind of logic inverse (positive->negative) instead of usual (negative->positive)
+    -}
+
+    int gas_success    = test_prop_vote_ext(400, idx, phash,
+                                           seqno, weight_left - wt, priv,
+                                           false, true);
+
+    ;; Let's verify that vote passed and get expiery time
+
+    var (gas_time, stack) = invoke_method(get_proposal, [phash]);
+
+    tuple prop   = stack.first();
+    int expire   = prop.at(0);
+    tuple voters = prop.at(4);
+    ;; Should not be empty
+    throw_if(500, voters.null?());
+    ;; Should match voter id
+    throw_unless(501, idx == voters~list_next());
+    ;; Should be the only voter
+    throw_unless(502, voters.null?());
+    ;; Weight decrease change accordingly to the validator weight
+    throw_unless(503, weight_left - wt == prop.at(5));
+
+    ;; Wait till proposal expires
+    wait_till(expire + 1);
+
+    ;; Make sure we won't vote from same validator
+    vdesc~idict_delete?(16, idx);
+
+    (_, idx, desc) = vdesc.random_elem(16, false);
+    (pub, wt, _)   = desc.parse_vdesc();
+    priv           = keys.pick_key(pub);
+
+
+    int op         = op::vote_for_config_proposal;
+    var vote       = generate_vote_msg_external(idx, phash);
+    slice msg      = generate_external_msg(op, seqno + 1, now(), priv, vote, true);
+
+    var (gas_fail, _)   = invoke_method(recv_external, [msg]);
+
+    ;; Proposal should be removed in case it's expired
+    int gas_removed = assert_proposal_removed(700, phash);
+
+    return gas_prop + gas_success + gas_time + gas_fail + gas_removed;
+}
+
+int __test_ext_vote_already_voted() {
+    default_config();
+
+    ;; Setting keys so we can vote
+    cell keys = set_new_validators_keys();
+
+    cell vset = config_param(config_params::current_validators_set);
+    var (_, _, _, _, total_weight, vdesc) = vset.parse_vset();
+
+    var (gas_prop, phash, critical?) = submit_valid_proposal(300, null(), null(), true);
+
+    var (_, idx, desc) = vdesc.random_elem(16, false);
+    var (pub, wt, _)   = desc.parse_vdesc();
+
+    int priv           = keys.pick_key(pub);
+    int weight_exp     = muldiv(total_weight, 3, 4) - wt;
+    int seqno          = 0;
+
+    int gas_success    = test_prop_vote_ext(400, idx, phash,
+                                           seqno, weight_exp, priv,
+                                           false, true);
+
+
+    int gas_fail       = test_prop_vote_ext(500, idx, phash,
+                                            seqno + 1, weight_exp, priv,
+                                            false, false);
+
+    return gas_prop + gas_success + gas_fail;
+}
+
+{-
+  Note about vote rounds logic.
+  Proposal vote round is a round of current validators set change.
+  Each change round counter increases.
+  In case there is remaining weight left loss counter increases.
+-}
+
+int __test_ext_vote_round_change_on_vote() {
+    {-
+      Case supposed to verify that
+      If vote received after round end:
+      1) Remaining weight is set to defaults (3/4 of total)
+      2) If any weight remaining at the end of round loss counter increases
+      3) Round counter increases
+      4) Voters list resets
+      5) vset_id changes accordingly to new vset hash
+    -}
+
+    default_config();
+
+    ;; Setting keys so we can vote
+    cell keys  = set_new_validators_keys();
+    cell vset  = config_param(config_params::current_validators_set);
+
+    var (_, _, _, _, total_weight, vdesc) = vset.parse_vset();
+
+    var (gas_prop, phash, critical?) = submit_valid_proposal(300, null(), null(), true);
+
+    ;; Picking from the top (highest weight)
+    var (idx, desc, _) = vdesc.udict_get_min?(16);
+    var (pub, wt, _)   = desc.parse_vdesc();
+
+    int priv           = keys.pick_key(pub);
+    int weight_left    = muldiv(total_weight, 3, 4);
+    int seqno          = 0;
+
+    int gas_first      = test_prop_vote_ext(400, idx, phash,
+                                            seqno, weight_left - wt, priv,
+                                            false, true);
+    seqno += 1;
+
+    ;; Veirfying voter related changes
+    var (gas_before, stack) = invoke_method(get_proposal, [phash]);
+
+    tuple prop   = stack.first();
+    tuple voters = prop.at(4);
+    ;; Should not be empty
+    throw_if(500, voters.null?());
+    ;; Should match voter id
+    throw_unless(501, idx == voters~list_next());
+    ;; Should be the only voter
+    throw_unless(502, voters.null?());
+    ;; Should match vset id
+    throw_unless(503, vset.cell_hash() == prop.at(3));
+    ;; Weight decrease change accordingly to the validator weight
+    throw_unless(504, weight_left - wt == prop.at(5));
+
+    int rounds_left = prop.at(6);
+    int losses      = prop.at(7);
+    int wins        = prop.at(8);
+
+    cell new_vset = next_round();
+    ;; Self test in a way
+    throw_if(505, new_vset.cell_hash() == vset.cell_hash());
+
+    ;; Picking from the bottom to make sure that weight is different
+    (idx, desc, _)         = vdesc.udict_get_max?(16);
+    var (pub, wt_new, _)   = desc.parse_vdesc();
+    priv                   = keys.pick_key(pub);
+
+    throw_if(504, wt == wt_new);
+
+    int gas_second      = test_prop_vote_ext(600, idx, phash,
+                                             seqno, weight_left - wt_new, priv,
+                                             false, true);
+
+
+    var (gas_after, stack) = invoke_method(get_proposal, [phash]);
+    tuple prop   = stack.first();
+    tuple voters = prop.at(4);
+
+    ;; Same deal as in previous check
+    throw_if(700, voters.null?());
+    throw_unless(701, idx == voters~list_next());
+    ;; Null again because voters reset on round change
+    throw_unless(702, voters.null?());
+    ;; Vset id should change
+    throw_unless(703, new_vset.cell_hash() == prop.at(3));
+    ;; Weight decrease change accordingly to the validator weight
+    throw_unless(704, weight_left - wt_new == prop.at(5));
+    ;; Round counter decreased
+    throw_unless(705, rounds_left - 1 == prop.at(6));
+    ;; Losses counter increased
+    throw_unless(706, losses + 1 == prop.at(7));
+    ;; Wins counter unchanged
+    throw_unless(707, wins == prop.at(8));
+
+    return gas_prop + gas_first + gas_second + gas_before + gas_after;
+
+}
+
+int __test_ext_vote_round_change_on_ticktock() {
+
+    {-
+      Same deal here, except check trigger is ticktock event.
+      First part is same as in previous test.
+      However proposal is picked at random via:
+      vote_dict.udict_get_nexteq?(256, random());
+      Meaning that result of random should be <= phash to match
+      otherwise it would fail to match and nothing would happen.
+      While having single proposal it's quite likely
+      that it won't hit on first tick_tock.
+    -}
+
+    default_config();
+
+    ;; Setting keys so we can vote
+    cell keys  = set_new_validators_keys();
+    cell vset  = config_param(config_params::current_validators_set);
+
+    var (_, _, _, _, total_weight, vdesc) = vset.parse_vset();
+
+    var (gas_prop, phash, critical?) = submit_valid_proposal(300, null(), null(), true);
+
+    var (_, idx, desc) = vdesc.random_elem(16, false);
+    var (pub, wt, _)   = desc.parse_vdesc();
+
+    int priv           = keys.pick_key(pub);
+    int weight_left    = muldiv(total_weight, 3, 4);
+    int seqno          = 0;
+    int gas_first      = test_prop_vote_ext(400, idx, phash,
+                                             seqno, weight_left - wt, priv,
+                                             false, true);
+
+    ;; Veirfying voter related changes
+    var (gas_before, stack) = invoke_method(get_proposal, [phash]);
+
+    tuple prop   = stack.first();
+    int expire   = prop.at(0);
+    tuple voters = prop.at(4);
+    ;; Should not be empty
+    throw_if(500, voters.null?());
+    ;; Should match voter id
+    throw_unless(501, idx == voters~list_next());
+    ;; Should be the only voter
+    throw_unless(502, voters.null?());
+    ;; Weight decrease change accordingly to the validator weight
+    throw_unless(503, weight_left - wt == prop.at(5));
+
+    int rounds_left = prop.at(6);
+    int losses      = prop.at(7);
+    int wins        = prop.at(8);
+
+    cell new_vset = next_round();
+
+    int seed = rand(123) + 1;
+
+    do {
+       set_seed(seed);
+       seed += 1;
+    } until(random() < phash);
+
+    ;; Will set seed back
+    set_seed(seed - 1);
+    ;; Now it's guaranteed to hit
+    int gas_tt = tick_tock();
+    var (gas_after, stack) = invoke_method(get_proposal, [phash]);
+    tuple prop   = stack.first();
+    ;; Voters should reset
+    throw_unless(600, prop.at(4).null?());
+    ;; Vset id should change
+    throw_unless(601, new_vset.cell_hash() == prop.at(3));
+    ;; Weight left should reset
+    throw_unless(602, weight_left == prop.at(5));
+    ;; Round counter decreased
+    throw_unless(603, rounds_left - 1 == prop.at(6));
+    ;; Losses counter increased
+    throw_unless(604, losses + 1 == prop.at(7));
+    ;; Wins counter unchanged
+    throw_unless(605, wins == prop.at(8));
+
+    return gas_prop + gas_first + gas_tt + gas_after;
+}
+
+int __test_ext_vote_too_many_losses() {
+
+    default_config();
+
+    ;; Setting keys so we can vote
+    cell keys   = set_new_validators_keys();
+
+    var (gas_total, phash, critical?) = submit_valid_proposal(300, null(), null(), true);
+
+    cell vset  = config_param(config_params::current_validators_set);
+
+    var (_, _, _, _, total_weight, vdesc) = vset.parse_vset();
+
+
+    (_, int rounds, _, int max_loss, _, _, _, _) = get_test_vote_config(critical?);
+
+    int weight_left    = muldiv(total_weight, 3, 4);
+    int loss_count     = 0;
+    int seqno          = 0;
+
+    ;; + 1 because counter increases only on vote after next round
+    repeat (max_loss + 1) {
+
+
+
+        var (gas_vote, _, _)    = vdesc.submit_valid_vote_ext(keys, 400,
+                                                              phash, seqno,
+                                                              weight_left);
+        seqno += 1;
+        var (gas_lookup, stack) = invoke_method(get_proposal, [phash]);
+        tuple prop = stack.first();
+
+        throw_unless(500, prop.at(7) == loss_count);
+        throw_unless(501, prop.at(6) == rounds);
+
+        next_round();
+
+        gas_total  += gas_vote + gas_lookup;
+        loss_count += 1;
+        rounds     -= 1;
+    }
+
+    ;; Unrolling the last one
+
+
+    int op             = op::vote_for_config_proposal;
+    var (_, idx, desc) = vdesc.random_elem(16, false);
+    var (pub, wt, _)   = desc.parse_vdesc();
+    int priv           = keys.pick_key(pub);
+
+    var vote           = generate_vote_msg_external(idx, phash);
+    slice msg          = generate_external_msg(op, seqno, now(), priv, vote, true);
+
+
+    var (gas_last, _)  = invoke_method(recv_external, [msg]);
+
+    int gas_removed    = assert_proposal_removed(700, phash);
+
+    return gas_total + gas_last + gas_removed;
+}
+
+int __test_ext_vote_win_round() {
+
+    {-
+      Testing behaviour on round win
+    -}
+
+    default_config();
+
+    ;; Setting keys so we can vote
+    cell keys   = set_new_validators_keys();
+    cell vset   = config_param(config_params::current_validators_set);
+
+    var (_, _, _, _, total_weight, vdesc) = vset.parse_vset();
+
+    var (gas_total, phash, critical?) = submit_valid_proposal(300, null(), null(), true);
+
+    ;; Backing up validators desc
+    cell vdesc_before  = vdesc;
+    var (min_wins, _) = get_vote_wl(critical?);
+
+    ;; In configuration wehere min_wins is == 1 we can only run test partially
+    int last_round? = min_wins > 1 ? false : true;
+    int seqno       = 0;
+    int weight_left = muldiv(total_weight, 3, 4);
+
+    var (gas_vote, weight_after, seqno) = vdesc_before~win_vote_round_ext(keys, 400,
+                                                                          phash, seqno,
+                                                                          weight_left);
+
+    var (gas_lookup, stack) = invoke_method(get_proposal, [phash]);
+    gas_total += gas_vote + gas_lookup;
+
+    tuple prop = stack.first();
+    ;; weight_after should match
+    throw_unless(500, weight_after == prop.at(5));
+    ;; Wins counter should increase
+    int wins = prop.at(8);
+    throw_unless(501, wins == 1);
+
+    int exp_code = config_vote::accepted;
+    ;; Using vdesc_before to make sure we won't clash voters
+    var (gas_after, wt, _) = vdesc_before.submit_valid_vote_ext(keys, 600,
+                                                                phash, seqno,
+                                                                weight_after);
+    seqno += 1;
+    ;; Now test that next vote won't trigger another win in the current round
+    var (gas_lookup_after, stack) = invoke_method(get_proposal, [phash]);
+    prop = stack.first();
+    ;; weight_left should still decrease
+    throw_unless(502, weight_after - wt == prop.at(5));
+    ;; Wins should not change
+    throw_unless(503, wins == prop.at(8));
+
+    gas_total += gas_after + gas_lookup_after;
+
+    next_round();
+
+    ;; Now testing that on the next round we can win again
+    ;; If there is no more rounds we can't run this part
+
+    if ( ~ last_round?  ) {
+        last_round? = wins + 1 >= min_wins ? true : false;
+        ;; Using original vdesc because voters reset in this part
+        var (gas_next, weight_left, seqno)  = vdesc~win_vote_round_ext(keys, 700,
+                                                                       phash, seqno,
+                                                                       weight_left);
+
+        var (gas_next_lookup, stack) = invoke_method(get_proposal, [phash]);
+
+        gas_total += gas_next + gas_next_lookup;
+
+        prop = stack.first();
+        if ( last_round? ) {
+            ;; Accepted proposal get's removed
+            gas_total += assert_proposal_removed(800, phash);
+        }
+        else {
+            throw_unless(505, weight_left == prop.at(5));
+            throw_unless(506, wins + 1 == prop.at(8));
+        }
+    }
+
+    return gas_total;
+}
+
+
+int __test_ext_vote_too_many_rounds() {
+
+    default_config();
+
+    ;; Setting keys so we can vote
+    cell keys   = set_new_validators_keys();
+    cell vset   = config_param(config_params::current_validators_set);
+
+    var (_, _, _, _, total_weight, vdesc) = vset.parse_vset();
+
+    int weight_left = muldiv(total_weight, 3, 4);
+
+    {-
+      To get to this case min_wins - 1 + max_loss - 1
+      should be larger than max_rounds.
+      Otherwise win or loss scenario will trigger.
+      in current configuration it's not possible.
+      So we would change vote config to trigger that case.
+    -}
+
+    cell vote_conf = get_test_vote_config_int(false);
+
+    var( min_tot_rounds, max_tot_rounds,
+        min_wins, max_losses,
+        min_store_sec, max_store_sec,
+        bit_price, cell_price) = vote_conf.parse_test_vote_config();
+
+    min_wins       = 4;
+    max_losses     = 3;
+    max_tot_rounds = 3 + 2;
+
+    var new_vote = begin_cell().store_uint(0x36, 8)
+                               .store_uint(min_tot_rounds, 8)
+                               .store_uint(max_tot_rounds, 8)
+                               .store_uint(min_wins, 8)
+                               .store_uint(max_losses, 8)
+                               .store_uint(min_store_sec, 32)
+                               .store_uint(max_store_sec, 32)
+                               .store_uint(bit_price, 32)
+                               .store_uint(cell_price, 32)
+                  .end_cell();
+
+    ;; Let's set both to equal configuration for simplicity
+    var new_vote_conf = begin_cell().store_uint(0x91, 8)
+                                    .store_ref(new_vote)
+                                    .store_ref(new_vote)
+                                    .end_cell();
+    cell config       = get_config();
+    config~idict_set_ref(32, config_params::voting_setup, new_vote_conf);
+    set_global_config(config);
+    ;; proposal_storage_price method works with contract config dict instead of config_param
+    set_contract_config(config);
+
+    var (gas_total, phash, critical?) = submit_valid_proposal(300, null(), null(), true);
+
+    ;; Self-test
+    var (_, rounds, wins, losses, _, _, _, _) = get_test_vote_config(critical?);
+    throw_unless(400, rounds == max_tot_rounds);
+    throw_unless(401, wins   == min_wins);
+    throw_unless(402, losses == max_losses);
+    ;; Now we can loose 2 and win 3 rounds and trigger condition in question
+    int seqno = 0;
+    repeat( min_wins - 1 ) {
+       (int gas_win, _, seqno) = vdesc.win_vote_round_ext(keys, 500,
+                                                          phash, seqno,
+                                                          weight_left);
+        gas_total      += gas_win;
+        next_round();
+    }
+
+    cell vdesc_bak = vdesc;
+    int exp_code   = config_vote::accepted;
+
+    repeat ( losses ) {
+        (int gas_vote, _, _) = vdesc~submit_valid_vote_ext(keys, 600,
+                                                           phash, seqno,
+                                                           weight_left);
+
+        gas_total += gas_vote;
+        seqno     += 1;
+        next_round();
+    }
+
+    var (gas_lookup, stack) = invoke_method(get_proposal, [phash]);
+
+    tuple prop = stack.first();
+    throw_unless(403, min_wins - 1 == prop.at(8));
+    throw_unless(404, max_losses - 1 == prop.at(7));
+    ;; No more rounds left
+    throw_unless(405, prop.at(6) == 0);
+
+    ;; Now if we submit next vote it should trigger error
+    exp_code = config_vote::error;
+    var (gas_fail, _, _) = vdesc_bak.submit_valid_vote_ext(keys, 700,
+                                                           phash, seqno,
+                                                           total_weight);
+
+    int gas_removed      = assert_proposal_removed(800, phash);
+
+    return gas_total + gas_lookup + gas_fail + gas_removed;
+}
+
+int __test_ext_vote_proposal_accepted_data_changed() {
+
+    default_config();
+
+    ;; Setting keys so we can vote
+    cell keys   = set_new_validators_keys();
+    cell vset   = config_param(config_params::current_validators_set);
+    var (_, _, _, _, total_weight, vdesc) = vset.parse_vset();
+
+    {-
+      Testing case where config param hash value changed before proposal got accepted.
+      How could that happen? Perhaps forced by masterkey.
+    -}
+
+    int new_dummy   = random();
+    int changed_val = generate_different(new_dummy, 256, false);
+    cell new_val    = begin_cell().store_uint(new_dummy, 256).end_cell();
+    cell ch_val     = begin_cell().store_uint(changed_val, 256).end_cell();
+
+    ;; We need to pick config index that won't break anything during the vote
+    cell config = get_config();
+    int  idx    = 2; ;;minter address totally irrelevant to vote
+    var (prev_val, _) = config.idict_get_ref?(32, idx);
+
+    var (gas_total, phash, critical?) = submit_valid_proposal(300, idx, new_val, true);
+    var (wins, _) = get_vote_wl(critical?);
+    int seqno       = 0;
+    int weight_left = muldiv(total_weight, 3, 4);
+    ;; Some time after proposal creation config value was changed
+    config~idict_set_ref(32, idx, ch_val);
+
+    ;; Updating config everywhere
+    set_global_config(config);
+    set_contract_config(config);
+    repeat(wins) {
+        (int gas_vote, _, seqno) = vdesc.win_vote_round_ext(keys, 400,
+                                                            phash, seqno,
+                                                            weight_left);
+        gas_total += gas_vote;
+        next_round();
+    }
+
+    {-
+    ;; Proposal should get removed
+    assert_proposal_removed(500, phash);
+    ;; Updating global config from contract state
+    update_config();
+    ;; Config value should not change to the new_val
+    throw_unless(501, ch_val.cell_hash() == config_param(idx).cell_hash());
+    -}
+
+    return gas_total;
+}
+
+int __test_ext_vote_proposal_accepted_became_mandatory() {
+
+    default_config();
+
+    ;; Setting keys so we can vote
+    cell keys   = set_new_validators_keys();
+    cell vset   = config_param(config_params::current_validators_set);
+    var (_, _, _, _, total_weight, vdesc) = vset.parse_vset();
+
+    {-
+      Testing case where parameter in question became mandatory
+      before proposal was accepted
+    -}
+
+    cell prev_val  = null();
+    cell config    = get_config();
+
+    (cell mandatory, _) = config.idict_get_ref?(32, config_params::mandatory_params);
+
+    int idx       = 0;
+
+    ;; Picking not mandatory parameter
+    do {
+        ( _, idx, prev_val) = config.random_elem_ref(32, true, true);
+        ( _, int f?)        = mandatory.idict_get?(32, idx);
+    } until( ~ f? );
+
+    ;; false flag indicates that value can be actual null
+    var (gas_total, phash, critical?) = submit_valid_proposal(300, idx, null(), false);
+    var (wins, _) = get_vote_wl(critical?);
+    ;; int ctr       = 0;
+
+    {-
+      Prameter index becomes mandatory and can't be nulled.
+      Any non-null value would work perfectly fine.
+    -}
+
+    mandatory~idict_set_ref(32, idx, prev_val);
+    config~idict_set_ref(32, config_params::mandatory_params, mandatory);
+
+    ;; Updating config everywhere
+    set_global_config(config);
+    set_contract_config(config);
+
+    int seqno = 0;
+    int weight_left = muldiv(total_weight, 3, 4);
+    repeat(wins) {
+        ;; ctr += 1;
+        ;; int last_round = (ctr == wins); If uncommented produces build err
+        (int gas_vote, _, seqno) = vdesc.win_vote_round_ext(keys, 400,
+                                                            phash, seqno,
+                                                            weight_left);
+        gas_total += gas_vote;
+        next_round();
+    }
+
+    ;; Proposal should get removed
+    assert_proposal_removed(500, phash);
+    ;; Updating global config from contract state
+    update_config();
+    ;; Proposal value should not change
+    throw_unless(501, prev_val.cell_hash() == config_param(idx).cell_hash());
+    return gas_total;
+}
+
+int __test_ext_vote_proposal_accepted_became_critical() {
+
+    default_config();
+
+    ;; Setting keys so we can vote
+    cell keys   = set_new_validators_keys();
+    cell vset   = config_param(config_params::current_validators_set);
+    var (_, _, _, _, total_weight, vdesc) = vset.parse_vset();
+
+    {-
+      Testing case where parameter in question became critical
+      before proposal was accepted.
+      Almost identical to previous one, but different lookup dictionary.
+    -}
+
+    cell prev_val  = null();
+    cell config    = get_config();
+
+    (cell critical, _) = config.idict_get_ref?(32, config_params::critical_params);
+
+    int  idx       = 0;
+
+    ;; Picking not critical parameter
+    do {
+        ( _, idx, prev_val) = config.random_elem_ref(32, true, true);
+        ( _, int f?)        = critical.idict_get?(32, idx);
+    } until( ~ f? );
+
+    var (gas_total, phash, critical?) = submit_valid_proposal(300, idx, null(), true);
+    var (wins, _) = get_vote_wl(critical?);
+    ;; int ctr       = 0;
+    int weight_left = muldiv(total_weight, 3, 4);
+
+    ;; Parameter becomes critical
+    critical~idict_set_ref(32, idx, prev_val);
+    config~idict_set_ref(32, config_params::critical_params, critical);
+
+    ;; Updating config everywhere
+    set_global_config(config);
+    set_contract_config(config);
+
+    int seqno = 0;
+    repeat(wins) {
+        ;; ctr += 1;
+        ;; int last_round?          = (ctr == wins);
+        (int gas_vote, _, seqno) = vdesc.win_vote_round_ext(keys, 400,
+                                                            phash, seqno,
+                                                            weight_left);
+        gas_total += gas_vote;
+        next_round();
+    }
+
+    ;; Proposal should get removed
+    assert_proposal_removed(500, phash);
+    ;; Updating global config from contract state
+    update_config();
+    ;; Proposal value should not change
+    throw_unless(501, prev_val.cell_hash() == config_param(idx).cell_hash());
+    return gas_total;
+
+}
+
+int __test_ext_vote_proposal_accepted() {
+
+    default_config();
+
+    ;; Setting keys so we can vote
+    cell keys   = set_new_validators_keys();
+    cell vset   = config_param(config_params::current_validators_set);
+    var (_, _, _, _, total_weight, vdesc) = vset.parse_vset();
+
+    {-
+      Testing successfull case
+      Config value by idx should change to the value specified
+    -}
+
+    cell new_val  = begin_cell().store_uint(random(), 256).end_cell();
+
+    var ( _, idx, prev_val) = get_config().random_elem_ref(32, true, true);
+
+    var (gas_total, phash, critical?) = submit_valid_proposal(300, idx, new_val, true);
+    var (wins, _) = get_vote_wl(critical?);
+    ;; int ctr      = 0;
+    int weight_left = muldiv(total_weight, 3, 4);
+    int seqno       = 0;
+
+    repeat(wins) {
+        ;; ctr += 1;
+        ;; int last_round?      = (ctr == wins);
+
+        (int gas_vote, _, seqno) = vdesc.win_vote_round_ext(keys, 400,
+                                                            phash, seqno,
+                                                            weight_left);
+        gas_total += gas_vote;
+        next_round();
+    }
+
+    ;; Proposal should get removed
+    assert_proposal_removed(500, phash);
+    ;; Updating global config from contract state
+    update_config();
+    ;; Value should change to new_val
+    throw_unless(501, new_val.cell_hash() == config_param(idx).cell_hash());
+
+    return gas_total;
+
+}

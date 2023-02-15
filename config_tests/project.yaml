@@ -1,0 +1,11 @@
+contract:
+  data: fift/data.fif
+  func:
+    - func/config-code.fc
+  tests:
+    - tests/next-vset.fc
+    - tests/new-proposal.fc
+    - tests/internal-vote.fc
+    - tests/external-msg.fc
+    - tests/vote-special.fc
+    - tests/external-vote.fc

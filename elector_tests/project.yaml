@@ -1,0 +1,12 @@
+contract:
+  data: fift/data.fif
+  func:
+    - func/elector-code.fc
+  tests:
+    - tests/elector-tests.fc
+    - tests/recover-stake.fc
+    - tests/upgrade-code.fc
+    - tests/vset-confirm.fc
+    - tests/vset-update.fc
+    - tests/complaint-test.fc
+    - tests/complaint-vote.fc

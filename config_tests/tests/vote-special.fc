@@ -1,0 +1,312 @@
+#include "constants.fc";
+#include "helpers.fc";
+#include "test-wraps.fc";
+
+{-
+  Testing special parameter ids
+  1) -999 change public key
+  2) -1000 code upgrade
+  3) -1001 upgrade elector code
+-}
+
+int test_proposal_change_pubkey(int external?){
+
+    default_config();
+    cell keys       = set_new_validators_keys();
+
+    ;; Creating key change proposal
+    int idx         = special_params::set_config_key;
+    int seqno       = 0;
+    var (priv, pub) = generate_keypair();
+    cell pub_cell   = begin_cell().store_uint(pub, 256).end_cell();
+    var (gas_prop, phash, critical?) = submit_valid_proposal(300, idx, pub_cell, true);
+
+    ;; Testing that current public key is accepted
+    int op         = rand(100);
+    int gas_old    = test_external_accepted(400, op,
+                                            seqno, now(), config_masterkey,
+                                            null(), false);
+    seqno += 1;
+
+    ;; Wining proposal vote
+    cell vset      = config_param(config_params::current_validators_set);
+    if ( external? ) {
+        (int gas_win, seqno)  = vset.win_proposal_vote_ext(500, keys, phash,
+                                                           critical?, seqno);
+        gas_old += gas_win;
+    }
+    else {
+        gas_old += vset.win_proposal_vote(500, keys, phash, critical?, false);
+    }
+
+    ;; Testing that previous keys is not accepted anymore
+    int gas_nomore = test_external_accepted(600, op,
+                                            seqno, now(), config_masterkey,
+                                            null(), error::external_msg::sig_mismatch);
+
+    ;; And new one is accepted
+    int gas_new    = test_external_accepted(700, op,
+                                         seqno, now(), priv,
+                                         null(), false);
+    ;; Checking that config parameter updated too
+    update_config();
+    throw_unless(800, pub_cell.cell_hash() == config_param(idx).cell_hash());
+
+    return gas_prop + gas_old + gas_nomore + gas_new;
+}
+
+int __test_proposal_change_pubkey_int() {
+    return test_proposal_change_pubkey(false);
+}
+
+int __test_proposal_change_pubkey_ext() {
+    return test_proposal_change_pubkey(true);
+}
+
+int __test_change_pubkey_mc() {
+    ;; Testing changing pubkey with masterkey
+
+    default_config();
+
+    int op          = op::update_config_key;
+    int seqno       = 0;
+    var (priv, pub) = generate_keypair();
+    var pub_cell   = begin_cell().store_uint(pub, 256);
+
+    ;; Setting new public key via master key
+    int gas_set     = test_external_accepted(400, op,
+                                            seqno, now(), config_masterkey,
+                                            pub_cell, false);
+
+    seqno += 1;
+    ;; Testing that previous keys is not accepted anymore
+    int gas_nomore = test_external_accepted(500, op,
+                                            seqno, now(), config_masterkey,
+                                            null(), error::external_msg::sig_mismatch);
+
+    ;; Seqno is not updated due to message denied
+    ;; And new one is accepted
+    int gas_new    = test_external_accepted(700, op,
+                                            seqno, now(), priv,
+                                            null(), false);
+
+
+    return gas_set + gas_nomore + gas_new;
+}
+
+{-
+Seems like you can't really null stuff via idict_set_ref
+https://github.com/ton-blockchain/ton/blob/master/crypto/smartcont/config-code.fc#L194
+
+int __test_null_pubkey() {
+    {-
+      Testing case where pubkey is nulled
+    -}
+
+    default_config();
+    cell keys       = set_new_validators_keys();
+
+    ;; Creating key change proposal
+    int idx         = special_params::set_config_key;
+    int seqno       = 0;
+    var (gas_prop, phash, critical?) = submit_valid_proposal(300, idx, null(), false);
+
+    cell vset   = config_param(config_params::current_validators_set);
+    int gas_win = vset.win_proposal_vote(500, keys, phash, critical?);
+
+    return gas_prop + gas_win;
+}
+
+int __test_idict_set_ref() {
+    cell test_cell = begin_cell().store_uint(random(), 256).end_cell();
+    cell new_dict  = idict_set_ref(new_dict(), 32, 1234, test_cell);
+    ;; Throws 7 since value can't be null()
+    new_dict~idict_set_ref(32, 1234, null());
+    return new_dict.cell_hash();
+}
+-}
+
+int test_proposal_code_upgrade(int external?) {
+
+    default_config();
+    cell keys     = set_new_validators_keys();
+
+
+    ;; cell new_code = begin_cell().store_uint(random(), 256).end_cell();
+    cell new_code = load_contract_code();
+    cell pval     = begin_cell().store_ref(new_code).end_cell();
+
+    ;; Creating config update code proposal
+    int idx       = special_params::update_config_code;
+    var (gas_total, phash, critical?) = submit_valid_proposal(300, idx, pval, true);
+
+    cell vset     = config_param(config_params::current_validators_set);
+    if ( external? ) {
+        (int gas_win, _) = vset.win_proposal_vote_ext(500, keys, phash,
+                                                      critical?, 0);
+        gas_total += gas_win;
+    }
+    else {
+        gas_total += vset.win_proposal_vote(400, keys, phash, critical?, idx);
+    }
+
+    assert_code_upgrade(600, new_code);
+
+    return gas_total;
+}
+
+int __test_proposal_code_upgrade_int() {
+    return test_proposal_code_upgrade(false);
+}
+
+int __test_proposal_code_upgrade_ext() {
+    ;; Will throw. TODO
+    return test_proposal_code_upgrade(true);
+}
+
+int __test_code_upgrade_mc () {
+    default_config();
+    int  op        = op::set_new_code;
+    int  seqno     = 0;
+    cell new_code  = load_contract_code();
+    var  payload   = begin_cell().store_ref(new_code);
+
+    ;; Setting new code via masterkey
+    int gas_set     = test_external_accepted(400, op,
+                                            seqno, now(), config_masterkey,
+                                            payload, false);
+
+    ;; This actually works somehow!
+    assert_code_upgrade(600, new_code);
+
+    return gas_set;
+}
+
+{-
+int __test_proposal_elector_upgrade() {
+
+    default_config();
+    cell keys        = set_new_validators_keys();
+
+    cell new_code    = begin_cell().store_uint(random(), 256).end_cell();
+    cell pval        = begin_cell().store_ref(new_code).end_cell();
+
+    ;; Creating elector update code proposal
+    int idx          = special_params::update_elector_code;
+    int seqno        = 0;
+    var (gas_prop,    phash, critical?) = submit_valid_proposal(300, idx, pval, true);
+
+    cell vset        = config_param(config_params::current_validators_set);
+    int gas_win      = vset.win_proposal_vote(400, keys, phash, critical?, idx);
+    int elector_addr = config_param(config_params::elector_address).begin_parse()
+                                                                  .preload_uint(256);
+    slice elector    = generate_internal_address_with_custom_data(0, -1, elector_addr);
+    tuple actions    = parse_c5();
+    tuple elect_msg  = actions.first();
+    elect_msg.assert_elector_update_from(500, new_code, elector);
+    tuple vote_msg   = actions.second();
+    return gas_prop + gas_win;
+
+}
+-}
+
+int test_proposal_elector_upgrade(int external?) {
+
+    default_config();
+    cell keys        = set_new_validators_keys();
+
+    cell new_code    = begin_cell().store_uint(random(), 256).end_cell();
+    cell pval        = begin_cell().store_ref(new_code).end_cell();
+
+    ;; Creating elector update code proposal
+    int idx          = special_params::update_elector_code;
+    int seqno        = 0;
+    var (gas_total, phash, critical?) = submit_valid_proposal(300, idx, pval, true);
+
+    cell vset        = config_param(config_params::current_validators_set);
+    if ( external? ) {
+        (int gas_win, _) = vset.win_proposal_vote_ext(500, keys, phash,
+                                                      critical?, seqno);
+        gas_total += gas_win;
+        set_c5(get_prev_c5());
+    }
+    else {
+        gas_total += vset.win_proposal_vote(400, keys, phash, critical?, idx);
+    }
+    int elector_addr = config_param(config_params::elector_address).begin_parse()
+                                                                  .preload_uint(256);
+    slice elector    = generate_internal_address_with_custom_data(0, -1, elector_addr);
+    tuple actions    = parse_c5();
+    throw_if(500, actions.null?());
+    int exp_cnt = external? ? 1 : 2;
+    throw_unless(501, actions.tuple_length() == exp_cnt);
+
+    tuple elect_msg  = actions.first();
+    elect_msg.assert_elector_update_from(600, new_code, elector);
+
+    return gas_total;
+}
+
+int __test_proposal_elector_upgrade_int() {
+    return test_proposal_elector_upgrade(false);
+}
+
+int __test_proposal_elector_upgrade_ext() {
+    return test_proposal_elector_upgrade(true);
+}
+
+int __test_elector_upgrade_mc() {
+
+    default_config();
+
+    cell new_code = begin_cell().store_uint(random(), 256).end_cell();
+    var  payload  = begin_cell().store_ref(new_code);
+
+    int  op       = op::update_elector_code;
+    int  seqno    = 0;
+
+    ;; Setting new code via masterkey
+    int gas_set   = test_external_accepted(400, op,
+                                           seqno, now(), config_masterkey,
+                                           payload, false);
+
+    int elector_addr = config_param(config_params::elector_address).begin_parse()
+                                                                  .preload_uint(256);
+    slice elector    = generate_internal_address_with_custom_data(0, -1, elector_addr);
+    tuple actions    = parse_c5();
+    throw_if(500, actions.null?());
+    throw_unless(501, actions.tuple_length() == 1);
+
+    tuple elect_msg  = actions.first();
+    elect_msg.assert_elector_update_from(600, new_code, elector);
+
+    return gas_set;
+}
+
+int __test_update_config_param_mc() {
+    ;; Case where config parameter is forced via masterkey
+
+    default_config();
+
+    cell new_val            = begin_cell().store_uint(random(), 256).end_cell();
+    var ( _, idx, prev_val) = get_config().random_elem_ref(32, true, true);
+
+    int op    = op::update_config_parameter;
+    int seqno = 0;
+
+    var payload = begin_cell().store_int(idx, 32).store_ref(new_val);
+
+    ;; Setting new code via masterkey
+    int gas_set   = test_external_accepted(400, op,
+                                           seqno, now(), config_masterkey,
+                                           payload, false);
+
+    ;; Updating global config from contract state
+    update_config();
+    ;; Value should change to new_val
+    throw_unless(500, new_val.cell_hash() == config_param(idx).cell_hash());
+
+
+    return gas_set;
+}
+
