@@ -6,6 +6,9 @@ int get_gl() asm "GASLIMITSTEMP DROP";
 slice sign_data(slice data, int priv_key) asm "SIGNS";
 () set_c5(cell c5) impure asm "c5 POP";
 
+(tuple) get_test_c7() impure asm "c7 PUSH";
+() set_c7(tuple t) impure asm "c7 POP";
+
 int list_len(tuple t) {
     int len = 0;
 
@@ -59,8 +62,7 @@ cell validators_set(int valid_since, int valid_till, int total_count, int total_
 }
 
 
-
-_ default_config() impure inline_ref {
+_ election_config(int min_validators, int max_validators) impure inline {
     tuple config_params = null();
 
     (_, int elector_address)   = my_address().parse_std_addr();
@@ -73,9 +75,7 @@ _ default_config() impure inline_ref {
     config_params              = cons([config_params::config_address,config_addr_cell],
                                        config_params);
 
-    int max_validators    = 100;
     int max_main          = max_validators;
-    int min_validators    = 5;
     cell validators_cell  = begin_cell().store_uint(max_validators, 16)
                                          .store_uint(max_main,16)
                                          .store_uint(min_validators,16)
@@ -103,8 +103,13 @@ _ default_config() impure inline_ref {
 
     set_config_multi(config_params);
 
-    randomize_lt();
+    ;; randomize_lt();
 
+}
+
+_ default_config() impure inline_ref {
+
+    election_config(13, 1000);
 }
 
 slice default_address() impure inline_ref {
