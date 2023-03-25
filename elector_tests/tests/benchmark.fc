@@ -1,0 +1,155 @@
+#include "helpers.fc";
+#include "constants.fc";
+
+const int test_max_validators = 400;
+const int test_min_validators = 13;
+(int) benchmark_elections(int winners, int losers, int stake_at) impure {
+
+    cell old_data = get_data();
+    cell pdict    = new_dict();
+    tuple prev_c7 = get_test_c7();
+
+    int factor = 1 << 16;
+    var (min_stake, max_stake, _, _) = get_validators_stakes();
+
+    repeat(losers) {
+        var (priv, pub) = pdict~generate_keypair_not_in();
+        submit_custom_stake(false, 0, null(), 12345, stake_at, min_stake, factor, priv, pub, 0);
+    }
+
+    repeat(winners) {
+        var (priv, pub) = pdict~generate_keypair_not_in();
+        submit_custom_stake(false, 0, null(), 12345, stake_at, max_stake, factor, priv, pub, 0);
+    }
+
+    wait_till(stake_at + 10);
+
+    int gas = tick_tock(false);
+
+    set_data(old_data);
+    set_c7(prev_c7);
+
+    return gas;
+}
+
+int __test_300() {
+
+  default_address();
+
+  election_config(test_min_validators, test_max_validators);
+  tick_tock(false);
+
+  var (_, stake_at) = assert_elections_announced(301);
+  return benchmark_elections(300,0, stake_at);
+}
+
+int __test_350() {
+
+  default_address();
+  election_config(test_min_validators, test_max_validators);
+  tick_tock(false);
+
+  var (_, stake_at) = assert_elections_announced(301);
+  return benchmark_elections(350,0, stake_at);
+}
+
+int __test_400() {
+
+  default_address();
+  election_config(test_min_validators, test_max_validators);
+  tick_tock(false);
+
+  var (_, stake_at) = assert_elections_announced(301);
+  return benchmark_elections(400,0, stake_at);
+}
+
+int __test_500() {
+
+  default_address();
+  election_config(test_min_validators, test_max_validators);
+  tick_tock(false);
+
+  var (_, stake_at) = assert_elections_announced(301);
+  return benchmark_elections(500,0, stake_at);
+}
+
+int __test_1000() {
+
+  default_address();
+  election_config(test_min_validators, test_max_validators);
+  tick_tock(false);
+
+  var (_, stake_at) = assert_elections_announced(301);
+  return benchmark_elections(1000,0, stake_at);
+}
+
+{-
+ This one takes a lotta gas.
+ Requires toncli test runner modification.
+ https://github.com/Trinketer22/toncli/blob/master/src/toncli/modules/fift/run_test.fif.template#L241
+int __test_bench() {
+
+
+  default_address();
+  default_config();
+
+  tick_tock(false);
+  var (_, stake_at) = assert_elections_announced(301);
+  int n = 100;
+  int has_20 = false;
+  int has_25 = false;
+  int has_30 = false;
+  int has_40 = false;
+  int has_50 = false;
+  int has_100 = false;
+
+
+
+
+	do {
+   int gas = benchmark_elections(100, n, stake_at);
+   int total = 100 + n;
+   if( (has_20 == false) & (gas >= 20000000 )) {
+    has_20 = true;
+    total~dump();
+    gas~dump();
+   }
+   if((has_25 == false) & (gas >= 25000000)){
+    has_25 = true;
+    total~dump();
+    gas~dump();
+   }
+
+   if((has_30 == false) & (gas >= 30000000)){
+    has_30 = true;
+    total~dump();
+    gas~dump();
+   }
+
+   if((has_40 == false) & (gas >= 40000000)){
+    has_40 = true;
+    total~dump();
+    gas~dump();
+   }
+
+   if((has_50 == false) & (gas >= 50000000)){
+    has_50 = true;
+    total~dump();
+    gas~dump();
+   }
+
+   if((has_100 == false) & (gas >= 100000000)){
+    has_100 = true;
+    total~dump();
+    gas~dump();
+   }
+
+   n += 10;
+  } until(has_100);
+
+  return 0;
+
+}
+-}
+
+
